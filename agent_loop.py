@@ -24,7 +24,7 @@ def run_loop(context: AgentContext, newmessages: list, config: AgentLoopconfig,
                 pendingMessages = []
 
             # 调用 LLM，得到一个 assistant 消息 dict
-            message = streamAssistantResponse(currentContext, config, emit, streamfunction)
+            message = streamAssistantResponse(currentContext,config, emit, streamfunction)
             newmessages.append(message)
 
             # error / aborted：统一收尾，把错误消息带回去
@@ -76,12 +76,7 @@ def run_loop(context: AgentContext, newmessages: list, config: AgentLoopconfig,
 def run_agent_loop(prompts: list, context: AgentContext, config: AgentLoopconfig,
                    emit: AgentEventSink, streamFn: StreamFn) -> list:
     newMessages = list(prompts)
-    currentContext = AgentContext(
-        system_prompt=context.system_prompt,
-        messages=list(context.messages),
-        tools=context.tools,
-        tree=context.tree
-    )
+    currentContext = context
     emit({"type": "agent_start"})
     emit({"type": "turn_start"})
     for prompt in prompts:

@@ -118,3 +118,48 @@ class JsonlTree:
                 last_lane = m["lane"]
         self.lanes.setdefault("main",None)
         self.active = last_lane
+
+# 多会话
+class SessionRepo:
+
+    def __init__(self,dir):
+        self.dir = dir
+        os.makedirs(dir,exist_ok=True)
+
+    def _path(self,name):
+        path=os.path.join(self.dir,name+".jsonl")
+        return path
+
+    def list(self):
+        out = []
+        for file in os.listdir(self.dir):
+            if not file.endswith(".jsonl"):
+                continue
+            name = file[:-len(".jsonl")]
+            created_at = 0
+            full = os.path.join(self.dir,file)
+            with open(full,"r",encoding="utf-8") as f:
+                first = f.readline().strip()
+                if first:
+                    created_at = json.loads(first).get("createdAt",0)
+            out.append({"name":name,"createdAt":created_at})
+        return out
+
+    # 创建一颗树
+    def create_tree(self,name):
+        path = self._path(name)
+        if os.path.exists(path):
+            raise FileExistsError(f"会话{name}已经存在")
+        new_tree = JsonlTree(path)
+        new_tree.create()
+        return new_tree
+
+    # 打开会话
+    def open(self,name):
+        path = self._path(name)
+        new_tree = JsonlTree(path)
+        if new_tree.exists():
+           new_tree.load()
+        else:
+            new_tree.create()
+        return new_tree 

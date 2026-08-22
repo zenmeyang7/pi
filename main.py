@@ -5,7 +5,7 @@ import queue
 import threading
 from dotenv import load_dotenv
 from type import StreamFn
-from jsonl_tree import JsonlTree
+from jsonl_tree import JsonlTree,SessionRepo
 # Windows 控制台默认 GBK，这里强制 UTF-8 避免中文乱码
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -69,7 +69,10 @@ def make_multiply_tool():
 class Steering():
     """后台线程读 stdin：__call__ 是"轮询"（agent 干活时非阻塞检查），
     wait 是"阻塞等待"（agent 答完后停下来等你下一条输入）。"""
-    def __init__(self):
+    def __init__(self,context,repo):
+        self.context = context
+        self.repo =repo
+        self.deferred = [] 
         self.input_queue = queue.Queue()
         threading.Thread(target=self.input_thread, daemon=True).start()
 
@@ -82,14 +85,82 @@ class Steering():
     def __call__(self):                           # 轮询：非阻塞
         out = []
         while not self.input_queue.empty():
-            out.append({"role": "user", "content": self.input_queue.get()})
+            line=self.input_queue.get()
+            if self._classify(line) == "msg":
+                out.append({"role":"user","content":line})
+            else:
+                self.deferred.append(line)
         return out
 
-    def wait(self):                               # 阻塞：等一条输入
-        line = self.input_queue.get()             # Queue.get() 原生阻塞，不空转
-        if line.lower() in ("quit", "exit", "q"):
-            return []                             # 用户说退出 -> 结束 REPL
-        return [{"role": "user", "content": line}]
+    # 先处理掉第一轮中未处理的部分，然后去处理追加的部分
+    def wait(self):                                       
+        while self.deferred:
+            line = self.deferred.pop(0)
+            status = self._classify(line)
+            if status == "quit":
+                return []
+            if status == "command":
+                self._run_command(line)
+                continue
+            return [{"role":"user","content":line}]
+        while True:
+            line = self.input_queue.get()
+            status = self._classify(line)
+            if status == "quit":
+                return []
+            if status == "command":
+                self._run_command(line)
+                continue
+            return [{"role":"user","content":line}]
+
+    # 对终端输入的语言进行分类处理
+    def _classify(self,line):
+        if line.lower() in ("quit","exit","q"):
+            return "quit"
+        elif line.startswith("/"):
+            return "command"
+        else:
+            return "msg" 
+
+    def _run_command(self,line):
+        # 没有会话树
+        if self.context.tree is None:
+            print("返回")
+            return
+        cmd = line.strip().lower()
+        if cmd == "/branch":
+            name=self.context.tree.branch()
+            print(f"已经换到了新的{name}分支上")
+        elif cmd == "/main":
+            self.context.tree.switch("main")
+            print("已经切回到主线\“main\"分支上")
+        elif cmd == "/list":
+            sessions = self.repo.list()
+            if not sessions:
+                print("还没有创建对话")
+                return
+            for s in sorted(sessions,key=lambda s:s["createdAt"],reverse=True):
+                print(f"{s["name"]}")
+        elif "/new" in cmd:
+            name = cmd[5:].strip()
+            if not name:
+                print("/new 使用错误，用法:/new<会话名>")
+                return
+            try:
+                new_tree=self.repo.create_tree(name)
+            except FileExistsError as e:
+                print(e)
+                return
+            self.context.tree = new_tree
+            print("已经切换到新的对话")
+        elif "/open" in cmd:
+            name = cmd[6:].strip()
+            if not name:
+                print("/open用法错误,用法:/open<会话名>")
+            new_tree = self.repo.opens(name)
+            print("会话已经打开")
+        else:
+            print(f"未知命令{line}")
 
 
 # ==================== 4. 事件打印器 ====================
@@ -141,20 +212,22 @@ def run_scenario(title, prompts, config, context):
 # 主程序
 if __name__ == "__main__":
     tools = [make_add_tool(), make_multiply_tool()]
-    session = JsonlTree("test_session.jsonl")
-    if session.exists():
-        session.load()
-        prompts = []
-        ctx_a = AgentContext(system_prompt="你是计算器，能用工具就用工具。", tools=tools,tree=session)
-        print("已恢复上次对话")
-    else:
-        session.create()
+    repo = SessionRepo("sessions")
+    session = repo.list()
+    if not session:
+        tree = repo.create_tree("default")
         prompts = [{"role":"user","content":"计算1+2和3*4"}]
-        ctx_a = AgentContext(system_prompt="你是计算器，能用工具就用工具。", tools=tools,tree=session)
+        print("首次运行，默认对话为default")
+    else:
+        session.sort(key = lambda s:s["createdAt"],reverse=True)
+        newset = session[0]["name"]
+        tree = repo.open(newset)
+        prompts = []
+    ctx_a = AgentContext(system_prompt="你是计算机，能用工具就用工具",tools=tools,tree=tree)
     # ---- 场景 A：REPL —— agent 答完会停下等你输入，quit 结束 ----
     class ConfigA(AgentLoopconfig):
         def __init__(self):
-            self.steering = Steering()
+            self.steering = Steering(ctx_a,repo=repo)
             super().__init__(
                 model="deepseek-chat",
                 get_steering_messages=self.steering,      # 干活时：非阻塞轮询有没有新输入
@@ -166,5 +239,5 @@ if __name__ == "__main__":
         "场景 A：REPL —— 启动后直接输入；agent 答完停下等你；输入 quit 结束",
         prompts=prompts,
         config=ConfigA(),
-        context=ctx_a
+        context=ctx_a,
     )
