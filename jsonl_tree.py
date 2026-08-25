@@ -90,6 +90,7 @@ class JsonlTree:
             out.append(self.entries[cur])
             # 先通过id找到节点对象，然后通过父节点找到上一条记录
             cur = self.entries[cur]["parentId"]
+        # 模型要找的是 从旧到新
         out.reverse()
         return [e["message"] for e in out]
 
@@ -118,6 +119,20 @@ class JsonlTree:
                 last_lane = m["lane"]
         self.lanes.setdefault("main",None)
         self.active = last_lane
+
+    def back(self,lane=None):
+        lane = lane or self.active
+        leaf = self.lanes[lane]
+        if leaf is None:
+            return
+        parentid = self.entries[leaf]["parentId"]
+        if parentid is None:
+            return
+        self.lanes[lane]=parentid
+        self._write({"kind":"lane","lane":lane,"leafId":parentid,"timestamp":int(time.time()*1000)})
+        self.active = lane
+        return parentid
+
 
 # 多会话
 class SessionRepo:
@@ -163,3 +178,16 @@ class SessionRepo:
         else:
             new_tree.create()
         return new_tree 
+
+    def fork(self,name,source_tree):
+        path = self._path(name)
+        if os.path.exists(path):
+            raise FileExistsError("文件已经存在")
+        new_tree = JsonlTree(path)
+        new_tree.create()
+        message = source_tree.for_path()
+        for m in message:
+            new_tree.append(m)
+        return new_tree
+
+

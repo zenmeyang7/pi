@@ -124,9 +124,6 @@ class Steering():
 
     def _run_command(self,line):
         # 没有会话树
-        if self.context.tree is None:
-            print("返回")
-            return
         cmd = line.strip().lower()
         if cmd == "/branch":
             name=self.context.tree.branch()
@@ -141,7 +138,7 @@ class Steering():
                 return
             for s in sorted(sessions,key=lambda s:s["createdAt"],reverse=True):
                 print(f"{s["name"]}")
-        elif "/new" in cmd:
+        elif cmd.startswith("/new"):
             name = cmd[5:].strip()
             if not name:
                 print("/new 使用错误，用法:/new<会话名>")
@@ -153,12 +150,34 @@ class Steering():
                 return
             self.context.tree = new_tree
             print("已经切换到新的对话")
-        elif "/open" in cmd:
+        elif cmd.startswith("/open"):
             name = cmd[6:].strip()
             if not name:
                 print("/open用法错误,用法:/open<会话名>")
-            new_tree = self.repo.opens(name)
+            new_tree = self.repo.open(name)
+            self.context.tree = new_tree
             print("会话已经打开")
+        elif cmd.startswith("/fork"):
+            # 新开一个对话可以保留原来的历史记录 有点像github里面的fork
+            name = cmd[6:].strip()
+            if not name:
+                print("/fork 指令缺少名字")
+                return
+            try:
+                new_tree = self.repo.fork(name,self.context.tree)
+            except FileExistsError as e:
+                print(e)
+                return
+            self.context.tree = new_tree
+        elif cmd =="/back":
+            if self.context.tree is None:
+                print("当前没有会话，先new或者是/open")
+                return
+            res = self.context.tree.back()
+            if res is None:
+                print("已经回退到头")
+            else:
+                print("已经回溯一步")
         else:
             print(f"未知命令{line}")
 

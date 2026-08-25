@@ -2,7 +2,7 @@
 import json
 import os
 from type import AgentContext, AgentEventSink, AgentLoopconfig, StreamFn
-
+from context_manager import count_context_tokens
 def run_loop(context: AgentContext, newmessages: list, config: AgentLoopconfig,
              emit: AgentEventSink, streamfunction: StreamFn):
     currentContext = context
@@ -103,6 +103,8 @@ def streamAssistantResponse(context: AgentContext, config: AgentLoopconfig,
         "messages": llmMessages,
         "tools": context.tools,
     }
+    tokens = count_context_tokens(context.system_prompt,llmMessages,context.tools)
+    print(f"本轮【context】调用消耗{tokens} token")
     options = {
         "api_key": os.getenv("DEEPSEEK_API_KEY"),
         "base_url": os.getenv("DEEPSEEK_BASE_URL"),
