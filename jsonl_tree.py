@@ -27,11 +27,9 @@ class JsonlTree:
 
     # 创建一个新的会话
     def create(self):
-        print("创建一个新的对话中")
         self.session_id = uuid.uuid4().hex
         self.created_at = int(time.time()*1000)
         self.lanes["main"]=None
-        print(f"新对话的id是{self.session_id},新对话创建的时间是{self.created_at}")
         header = {"kind":"header","id":self.session_id,"createdAt":self.created_at}
         with open(self.path,"w",encoding="UTF-8",newline="\n")as f:
             f.write(json.dumps(header,ensure_ascii=False)+"\n")
@@ -39,16 +37,13 @@ class JsonlTree:
 
     # 写入文件当成日记
     def _write(self,obj):
-        print("正在将操作写入文件")
         with self._lock:
             with open(self.path,"a",encoding="UTF-8",newline="\n")  as f:
                 f.write(json.dumps(obj,ensure_ascii=False)+"\n")
 
     # 在文件中追加消息
     def append(self,message,kind="message",lane = None):
-        print("正在存入追加的新消息")
         lane = lane or self.active
-        print(f"当前在{lane}分支上")
         entry = {
             "id":uuid.uuid4().hex,
             "message":message,
@@ -65,7 +60,6 @@ class JsonlTree:
 
     # 建立会话内不同的分支
     def branch(self,start_id=None):
-        print("正在该节点去建立你所需要的分支")
         leaf = start_id if start_id is not None else self.lanes.get(self.active)
         name = f"branch-{uuid.uuid4().hex[:8]}"
         self._write({"kind":"lane","lane":name,"leafId":leaf,"timestamp":int(time.time()*1000)})
@@ -75,13 +69,11 @@ class JsonlTree:
 
     # 转变分支
     def switch(self,lane):
-        print("正在转变到你想要的分支")
         self._write({"kind":"lane","lane":lane,"leafId":self.lanes[lane],"timestamp":int(time.time()*1000)})
         self.active = lane
 
     # 遍历路径 将消息从旧到新返回给大模型
     def for_path(self,lane=None):
-        print("正在找到所有的历史消息并返回给大模型")
         lane = lane or self.active
         # 存放每一个节点对象
         out = []
@@ -96,7 +88,6 @@ class JsonlTree:
 
     # 加载文件
     def load(self):
-        print("加载所有的操作")
         if not os.path.exists(self.path):
             return
         # 一个哨兵，记录最后一行的车道是谁
@@ -136,7 +127,7 @@ class JsonlTree:
 
 # 多会话
 class SessionRepo:
-
+    
     def __init__(self,dir):
         self.dir = dir
         os.makedirs(dir,exist_ok=True)

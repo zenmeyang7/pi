@@ -96,35 +96,69 @@ def StreamFn(model: str, llm_context: Dict, option: Dict):
         "model": model,
         "messages": [{"role": "system", "content": system}, *messages],
         "tools": [t.definition for t in tools],
+        "stream": True,
     }
     req = urllib.request.Request(
         f"{base_url}/chat/completions",
         data=json.dumps(body).encode(),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
     )
+    full_content = ""
+    tool_calls = []
+    stop_reason = None
     try:
         with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read())
-        choice = data["choices"][0]
-        msg = choice["message"]
-        reason = map_stop_reason(choice["finish_reason"])
-        yield {
-            "type": "done",
-            "reason": reason,
-            "message": {
-                "role": "assistant",
-                "content": msg.get("content", ""),
-                "tool_calls": msg.get("tool_calls"),
-                "stop_reason": reason,
-            },
-        }
+            for raw in resp:
+                line = raw.decode().strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                chunk = json.loads(data)
+                choice = chunk["choices"][0]
+                delta = choice.get("delta",{})
+                piece = delta.get("content", "")
+                if piece:
+                    full_content += piece
+                    yield {
+                        "type": "delta",
+                        "content":piece,
+                    }
+                for tc in delta.get("tool_calls", []):
+                    idx = tc.get("index",len(tool_calls))
+                    while len(tool_calls) <= idx:
+                        tool_calls.append({"id":"","type":"function","function":{
+                        "name":"","arguments":""}})
+                    slot = tool_calls[idx]
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function",{})
+                    if fn.get("name"):
+                        slot["function"]["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["function"]["arguments"] += fn["arguments"]
+                if choice.get("finish_reason"):
+                    stop_reason = map_stop_reason(choice["finish_reason"])
+            reason = stop_reason or "stop"
+            yield{
+                "type": "done",
+                "reason": reason,
+                "message": {
+                    "role": "assistant",
+                    "content": full_content,
+                    "tool_calls": tool_calls,
+                    "stop_reason": reason,
+                },
+            }
     except Exception as e:
         yield {
             "type": "error",
             "reason": "error",
             "message": {
                 "role": "assistant",
-                "content": "",
+                "content": full_content,
+                "tool_calls": tool_calls,
                 "stop_reason": "error",
                 "error_message": str(e),
             },

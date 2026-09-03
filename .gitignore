@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# API 密钥 + 本地会话数据（绝不能提交到 git）
+.env
+sessions/
+*.jsonl

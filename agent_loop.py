@@ -2,7 +2,7 @@
 import json
 import os
 from type import AgentContext, AgentEventSink, AgentLoopconfig, StreamFn
-from context_manager import count_context_tokens
+from context_manager import count_context_tokens,compact_context,MAX_TOKENS,count_token,count_message_tokens
 def run_loop(context: AgentContext, newmessages: list, config: AgentLoopconfig,
              emit: AgentEventSink, streamfunction: StreamFn):
     currentContext = context
@@ -14,8 +14,9 @@ def run_loop(context: AgentContext, newmessages: list, config: AgentLoopconfig,
 
         # 内层循环：工具调用轮次
         while has_more_tool_calls or pendingMessages:
-            # 先注入积压的用户输入
+            # 先去看用户有没有额外的输入
             if pendingMessages:
+                # 内部的存储结构现在是一个树，就需要把消息 append 到树里，append_message内部就会判断树是不是仍然存在，如果不存在就直接append到messages里
                 for m in pendingMessages:
                     emit({"type": "message_start", "message": m})
                     emit({"type": "message_end", "message": m})
@@ -25,6 +26,8 @@ def run_loop(context: AgentContext, newmessages: list, config: AgentLoopconfig,
 
             # 调用 LLM，得到一个 assistant 消息 dict
             message = streamAssistantResponse(currentContext,config, emit, streamfunction)
+            # 得到一条新消息
+            
             newmessages.append(message)
 
             # error / aborted：统一收尾，把错误消息带回去
@@ -32,11 +35,12 @@ def run_loop(context: AgentContext, newmessages: list, config: AgentLoopconfig,
                 emit({"type": "turn_end", "message": message, "toolResults": []})
                 emit({"type": "agent_end", "messages": newmessages})
                 return newmessages
-
+            # 查看返回的消息里面有无工具的调用
             tool_calls = message.get("tool_calls") or []
             tool_results = []
             has_more_tool_calls = False   # 默认这轮结束
             if tool_calls:
+                # 处理工具调用，如果是 length 截断保护 → 不执行，直接报错；否则执行工具调用 超出token限制
                 if message.get("stop_reason") == "length":
                     # 截断保护：不执行，全部报错，模型下一轮自己重发
                     for tc in tool_calls:
@@ -48,7 +52,7 @@ def run_loop(context: AgentContext, newmessages: list, config: AgentLoopconfig,
                                        "arguments may be truncated. Re-issue with complete arguments.",
                         })
                 else:
-                    # 正常执行：整个工具批次跑一遍，返回 tool_result 消息列表
+                    # 正常执行：整个工具批次跑一遍，返回 tool_result 消息列表 处理的是大模型返回的最新消息
                     executed = executeToolCalls(currentContext, message, config, emit)
                     tool_results = executed["messages"]
                 has_more_tool_calls = True   # 有工具调用 → 至少还要一轮
@@ -79,6 +83,7 @@ def run_agent_loop(prompts: list, context: AgentContext, config: AgentLoopconfig
     currentContext = context
     emit({"type": "agent_start"})
     emit({"type": "turn_start"})
+    # 这段是看有没有程序里面写的
     for prompt in prompts:
         emit({"type": "message_start", "message": prompt})
         emit({"type": "message_end", "message": prompt})
@@ -95,27 +100,30 @@ def run_agent_loop_continue():
 def streamAssistantResponse(context: AgentContext, config: AgentLoopconfig,
                             emit: AgentEventSink, streamFuction: StreamFn):
     # AgentMessage -> Message（只留 user/assistant/tool 并剥掉多余键）
-    tree = context.tree
+    tree = context.tree # 存储的历史消息
     history = tree.for_path() if tree else context.messages
-    llmMessages = config.convert_to_llm(history)
+    history = config.convert_to_llm(history)
+    options = {
+            "api_key": os.getenv("DEEPSEEK_API_KEY"),
+            "base_url": os.getenv("DEEPSEEK_BASE_URL"),
+        }
+    # 压缩上下文，用最大token和最近消息数限制
+    system_prompt,llmessages = compact_context(context.system_prompt,history,context.tools,MAX_TOKENS,options["api_key"],options["base_url"])
     llm_context = {
-        "system_prompt": context.system_prompt,
-        "messages": llmMessages,
+        "system_prompt": system_prompt,
+        "messages": llmessages,
         "tools": context.tools,
     }
-    tokens = count_context_tokens(context.system_prompt,llmMessages,context.tools)
-    print(f"本轮【context】调用消耗{tokens} token")
-    options = {
-        "api_key": os.getenv("DEEPSEEK_API_KEY"),
-        "base_url": os.getenv("DEEPSEEK_BASE_URL"),
-    }
-
+    # 计算本轮调用消耗的token数
+    tokens = count_context_tokens(system_prompt,llmessages,context.tools)
     # 消费 StreamFn 的事件流，在 done/error 处摘出裸消息（去掉 message 壳）
     finalmessage = None
+    # 找到大模型返回的最终一条消息
     for event in streamFuction(config.model, llm_context, options):
         if event["type"] in ("done", "error"):
             finalmessage = event["message"]
-
+        elif event["type"] == "delta":
+            emit(event)
     # 最终消息进 context（下一轮可见），并透传 start/end
     context.append_message(finalmessage)
     emit({"type": "message_start", "message": finalmessage})
@@ -123,18 +131,23 @@ def streamAssistantResponse(context: AgentContext, config: AgentLoopconfig,
     return finalmessage
 
 
-# 分发到顺序 / 并行两条路径
+# 工具的执行，分发到顺序 / 并行两条路径
 def executeToolCalls(currentContext: AgentContext, assistant_message: dict,
                      config: AgentLoopconfig, emit: AgentEventSink):
     # 需要调用的工具
     tool_calls = assistant_message.get("tool_calls") or []
-    has_sequential = False
+    # 是否串行
+    has_sequential = False 
     for tc in tool_calls:
+        # 找到当前需要调用的工具
         name = tc.get("function", {}).get("name")
+        # 判断我注册的工具里面有没有
         target_tool = next((t for t in currentContext.tools if t.name == name), None)
+        # 如果有，并且是串行模式，就标记为串行
         if target_tool and target_tool.execution_mode == "sequential":
             has_sequential = True
             break
+    # 如果有任何一个工具是串行模式，就走顺序执行，否则走并行执行
     if config.tool_execution == "sequential" or has_sequential:
         return executeToolCallsSequential(currentContext, tool_calls, config, emit)
     return executeToolCallsParallel(currentContext, tool_calls, config, emit)
@@ -145,6 +158,7 @@ def executeToolCallsSequential(currentContext: AgentContext, tool_calls: list,
                                config: AgentLoopconfig, emit: AgentEventSink):
     messages = []
     for tool_call in tool_calls:
+        # 找到需要调用的工具的id和name，发出开始事件
         tool_call_id = tool_call["id"]
         name = tool_call.get("function", {}).get("name")
         emit({"type": "tool_execution_start", "toolCallId": tool_call_id,
@@ -154,10 +168,10 @@ def executeToolCallsSequential(currentContext: AgentContext, tool_calls: list,
         preparation = prepareToolCall(currentContext, tool_call)
         if preparation["kind"] == "immediate":
             content, is_error = preparation["result"], preparation["isError"]
-        else:
+        else:# 工具已经准备好了
             executed = executePreparedToolCall(preparation, emit)
             content, is_error = executed["result"], executed["isError"]
-
+        # content 是工具的返回结果，is_error 是是否出错
         emit({"type": "tool_execution_end", "toolCallId": tool_call_id,
               "toolName": name, "result": content, "isError": is_error})
         messages.append(createToolResultMessage(tool_call_id, name, content, is_error))
@@ -172,6 +186,7 @@ def executeToolCallsParallel(currentContext: AgentContext, tool_calls: list,
 
 # 准备工具 + 校验参数
 def prepareToolCall(currentContext: AgentContext, tool_call: dict) -> dict:
+    # 从currentContext的tools里面检查是不是有对应的工具
     name = tool_call.get("function", {}).get("name")
     tool = next((t for t in currentContext.tools if t.name == name), None)
     if not tool:
@@ -199,5 +214,5 @@ def finalizeExecutedToolCall():
 
 # 包装成一条"工具结果消息"（wire format）
 def createToolResultMessage(tool_call_id: str, tool_name: str, content: str, is_error: bool) -> dict:
-    return {"role": "tool", "tool_call_id": tool_call_id,
+    return {"role": "tool", "tool_call_id": tool_call_id,"name":tool_name,
             "content": content, "isError": is_error}

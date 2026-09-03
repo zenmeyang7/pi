@@ -5,7 +5,7 @@ import queue
 import threading
 from dotenv import load_dotenv
 from type import StreamFn
-from jsonl_tree import JsonlTree,SessionRepo
+from jsonl_tree import SessionRepo
 # Windows 控制台默认 GBK，这里强制 UTF-8 避免中文乱码
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -149,14 +149,12 @@ class Steering():
                 print(e)
                 return
             self.context.tree = new_tree
-            print("已经切换到新的对话")
         elif cmd.startswith("/open"):
             name = cmd[6:].strip()
             if not name:
                 print("/open用法错误,用法:/open<会话名>")
             new_tree = self.repo.open(name)
             self.context.tree = new_tree
-            print("会话已经打开")
         elif cmd.startswith("/fork"):
             # 新开一个对话可以保留原来的历史记录 有点像github里面的fork
             name = cmd[6:].strip()
@@ -191,8 +189,7 @@ def make_printer():
         elif t == "turn_start":
             print("  [turn_start]")
         elif t == "message_start":
-            m = event["message"]
-            print(f"  [message_start] {m['role']:>9}: {m.get('content','')}")
+            print("  [message_start]")
         elif t == "message_end":
             print("  [message_end  ]")
         elif t == "tool_execution_start":
@@ -206,6 +203,8 @@ def make_printer():
         elif t == "agent_end":
             n = len(event["messages"])
             print(f"  [agent_end    ] 结束，共 {n} 条消息\n")
+        elif t == "delta":
+            print(event["content"], end="", flush=True)
     return emit
 
 # ==================== 5. 跑起来 ====================
@@ -230,6 +229,7 @@ def run_scenario(title, prompts, config, context):
 
 # 主程序
 if __name__ == "__main__":
+    # 是一个Agenttool的列表
     tools = [make_add_tool(), make_multiply_tool()]
     repo = SessionRepo("sessions")
     session = repo.list()
@@ -238,6 +238,7 @@ if __name__ == "__main__":
         prompts = [{"role":"user","content":"计算1+2和3*4"}]
         print("首次运行，默认对话为default")
     else:
+        # 找到最新的会话，打开它
         session.sort(key = lambda s:s["createdAt"],reverse=True)
         newset = session[0]["name"]
         tree = repo.open(newset)
@@ -251,7 +252,7 @@ if __name__ == "__main__":
                 model="deepseek-chat",
                 get_steering_messages=self.steering,      # 干活时：非阻塞轮询有没有新输入
                 wait_for_steering=self.steering.wait,     # 答完后：阻塞等你的下一条输入
-                tool_execution="parallel",
+                tool_execution="parallel",         # 串行
             )
 
     run_scenario(
