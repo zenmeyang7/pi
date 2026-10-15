@@ -1,12 +1,27 @@
 [project]
 name = "pi"
 version = "0.1.0"
-description = "Add your description here"
+description = "从零手写的 Agent 运行时：双层循环 + steering、手写 SSE、工具并行保序、会话树、上下文压缩、代码库 RAG"
 readme = "README.md"
 requires-python = ">=3.14"
+# 刻意保持极短的依赖表：LLM 调用、消息协议、工具调度、BM25/向量检索全部手写，
+# 只用标准库 + 下面这几个真正必要的包（没有 LangChain / 任何 Agent SDK）。
 dependencies = [
     "dotenv>=0.9.9",
-    "langchain>=1.3.14",
-    "langchain-deepseek>=1.1.0",
-    "pydantic>=2.13.4",
+    "onnxruntime-directml>=1.24.4",
+    "pymysql>=1.2.0",
+    "ragas>=0.4.3",
+    "tiktoken>=0.13.0",
+    "tokenizers>=0.23.3",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+# 各包（agent/ tools/ rag/）是平铺模块，根目录必须在 sys.path 上；
+# pytest 9 默认 importlib 导入模式下 `uv run pytest` 会 No module named 'rag'，
+# 这里显式声明 pythonpath 才对所有入口生效。
+pythonpath = ["."]

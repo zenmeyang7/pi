@@ -9,7 +9,18 @@ wheels/
 # Virtual environments
 .venv
 
+# 测试/工具缓存
+.pytest_cache/
+
+# 本地索引与模型权重：体积大（rag/models 有 1GB+）且可重建
+rag/index/
+rag/models/
+
 # API 密钥 + 本地会话数据（绝不能提交到 git）
 .env
 sessions/
 *.jsonl
+
+# 评测集必须提交：它是 eval/run.py 的数据源，
+# 夹在 *.jsonl 里会被一起忽略，这里显式取消。
+!eval/data/cases.jsonl

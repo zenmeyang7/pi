@@ -1,0 +1,39 @@
+{"query": "compact_context 函数怎么压缩超限的上下文", "path": "agent/context.py", "lines": [54, 63], "category": "function_location"}
+{"query": "executeToolCallsParallel 怎么保证结果按提交顺序收集", "path": "agent/loop.py", "lines": [207, 236], "category": "function_location"}
+{"query": "map_stop_reason 遇到未知 finish_reason 返回什么", "path": "agent/protocol.py", "lines": [89, 91], "category": "function_location"}
+{"query": "safe_path 用 commonpath 做了什么校验", "path": "tools/files.py", "lines": [5, 13], "category": "function_location"}
+{"query": "rrf 函数怎么融合多路召回结果", "path": "rag/store.py", "lines": [253, 272], "category": "function_location"}
+{"query": "tokenize 怎么把 camelCase 和下划线拆开", "path": "rag/store.py", "lines": [16, 26], "category": "function_location"}
+{"query": "AgentContext 这个类管理哪些数据", "path": "agent/protocol.py", "lines": [40, 48], "category": "class_responsibility"}
+{"query": "AgentTool 的 definition 和 execute 分别干什么的", "path": "agent/protocol.py", "lines": [29, 36], "category": "class_responsibility"}
+{"query": "AgentLoopconfig 能配置哪些行为", "path": "agent/protocol.py", "lines": [67, 86], "category": "class_responsibility"}
+{"query": "BM25 类是怎么给文档打分的", "path": "rag/store.py", "lines": [37, 68], "category": "class_responsibility"}
+{"query": "Steering 类的轮询和阻塞等待有什么区别", "path": "main.py", "lines": [36, 65], "category": "class_responsibility"}
+{"query": "OnnxCrossEncoderReranker 这个类怎么初始化的", "path": "rag/reranker.py", "lines": [80, 95], "category": "class_responsibility"}
+{"query": "stream_deepseek 里面调了 _stream_once 做什么", "path": "agent/protocol.py", "lines": [94, 123], "category": "call_relation"}
+{"query": "compact_context 里面怎么调 summarize 的", "path": "agent/context.py", "lines": [54, 63], "category": "call_relation"}
+{"query": "executeToolCalls 怎么决定走串行还是并行", "path": "agent/loop.py", "lines": [168, 182], "category": "call_relation"}
+{"query": "run_loop 在什么条件下退出", "path": "agent/loop.py", "lines": [18, 77], "category": "call_relation"}
+{"query": "prepareToolCall 和 executePreparedToolCall 是什么关系", "path": "agent/loop.py", "lines": [239, 265], "category": "call_relation"}
+{"query": "search_code 工具怎么调用 Retriever", "path": "tools/search.py", "lines": [31, 81], "category": "call_relation"}
+{"query": "上下文超过 token 上限之后怎么压缩", "path": "agent/context.py", "lines": [54, 63], "category": "semantic"}
+{"query": "工具调用结果怎么按提交顺序收集的", "path": "agent/loop.py", "lines": [207, 236], "category": "semantic"}
+{"query": "网络请求失败后怎么重试的", "path": "agent/protocol.py", "lines": [94, 123], "category": "semantic"}
+{"query": "怎么防止读取工作区以外的文件", "path": "tools/files.py", "lines": [5, 13], "category": "semantic"}
+{"query": "代码切片是怎么按函数边界切的", "path": "rag/chunker.py", "lines": [86, 105], "category": "semantic"}
+{"query": "会话树怎么创建新分支", "path": "agent/storage.py", "lines": [114, 122], "category": "semantic"}
+{"query": "那个管 token 计数的函数在哪", "path": "agent/context.py", "lines": [6, 20], "category": "vague_description"}
+{"query": "并发跑工具那段代码", "path": "agent/loop.py", "lines": [207, 236], "category": "vague_description"}
+{"query": "数据库连接是怎么建的", "path": "agent/storage.py", "lines": [14, 20], "category": "vague_description"}
+{"query": "退格回退功能怎么做的", "path": "agent/storage.py", "lines": [127, 143], "category": "vague_description"}
+{"query": "错误怎么包成事件的", "path": "agent/protocol.py", "lines": [205, 220], "category": "vague_description"}
+{"query": "normalize 函数怎么把向量归一化成单位长度", "path": "rag/store.py", "lines": [71, 75], "category": "function_location"}
+{"query": "chunk_file 函数怎么把一个文件切成多个 chunk", "path": "rag/chunker.py", "lines": [148, 160], "category": "function_location"}
+{"query": "IndexStore 这个类管哪些数据", "path": "rag/store.py", "lines": [92, 99], "category": "class_responsibility"}
+{"query": "tree 类是怎么把消息存成树形结构的", "path": "agent/storage.py", "lines": [55, 59], "category": "class_responsibility"}
+{"query": "streamAssistantResponse 怎么调 compact_context 压缩历史", "path": "agent/loop.py", "lines": [136, 165], "category": "call_relation"}
+{"query": "retrieve 里怎么调 rrf 融合词法和向量两路结果", "path": "rag/retriever.py", "lines": [40, 98], "category": "call_relation"}
+{"query": "向量是怎么归一化成单位长度的", "path": "rag/store.py", "lines": [71, 75], "category": "semantic"}
+{"query": "工具执行出错时异常是怎么被捕获的", "path": "agent/loop.py", "lines": [260, 265], "category": "semantic"}
+{"query": "切文件的入口那段代码", "path": "rag/chunker.py", "lines": [148, 160], "category": "vague_description"}
+{"query": "工具结果包装成消息那块", "path": "agent/loop.py", "lines": [278, 281], "category": "vague_description"}

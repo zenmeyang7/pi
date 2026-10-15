@@ -4,68 +4,15 @@ import sys
 import queue
 import threading
 from dotenv import load_dotenv
-from type import StreamFn
-from jsonl_tree import SessionRepo
-# Windows 控制台默认 GBK，这里强制 UTF-8 避免中文乱码
+from agent.loop import run_agent_loop
+from agent.protocol import AgentContext, AgentLoopconfig, AgentTool, stream_deepseek
+from agent.storage import SqlRepo, get_conn, init_schema
+from tools import get_tools
+from tools.search import init_retriever
+
 sys.stdout.reconfigure(encoding="utf-8")
 
 load_dotenv(".env")
-
-from type import AgentContext, AgentLoopconfig, AgentTool
-from agent_loop import run_agent_loop
-
-# ==================== 1. 两个假工具 ====================
-def make_add_tool():
-    def execute(tool_call_id: str, args: dict) -> str:
-        a, b = args["a"], args["b"]
-        return f"{a} + {b} = {a + b}"
-    return AgentTool(
-        name="add",
-        execute=execute,
-        execution_mode="parallel",       # add 是并行工具
-        definition={
-            "type": "function",
-            "function": {
-                "name": "add",
-                "description": "两个数相加",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "a": {"type": "number"},
-                        "b": {"type": "number"},
-                    },
-                    "required": ["a", "b"],
-                },
-            },
-        },
-    )
-
-def make_multiply_tool():
-    def execute(tool_call_id: str, args: dict) -> str:
-        a, b = args["a"], args["b"]
-        return f"{a} * {b} = {a * b}"
-    return AgentTool(
-        name="multiply",
-        execute=execute,
-        execution_mode="sequential",     # multiply 是顺序工具 -> 强制整批走顺序路径
-        definition={
-            "type": "function",
-            "function": {
-                "name": "multiply",
-                "description": "两个数相乘",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "a": {"type": "number"},
-                        "b": {"type": "number"},
-                    },
-                    "required": ["a", "b"],
-                },
-            },
-        },
-    )
-
-# ==================== 3. steering：读取用户终端输入 ====================
 class Steering():
     """后台线程读 stdin：__call__ 是"轮询"（agent 干活时非阻塞检查），
     wait 是"阻塞等待"（agent 答完后停下来等你下一条输入）。"""
@@ -78,11 +25,15 @@ class Steering():
 
     def input_thread(self):
         while True:
-            txt = input()
-            if txt.strip():                       # 空行直接忽略，不放进队列
+            try:
+                txt = input()
+            except (EOFError, KeyboardInterrupt):
+                self.input_queue.put("quit")
+                return
+            if txt.strip():                       
                 self.input_queue.put(txt.strip())
 
-    def __call__(self):                           # 轮询：非阻塞
+    def __call__(self):                           
         out = []
         while not self.input_queue.empty():
             line=self.input_queue.get()
@@ -92,7 +43,7 @@ class Steering():
                 self.deferred.append(line)
         return out
 
-    # 先处理掉第一轮中未处理的部分，然后去处理追加的部分
+    # 先消化上一轮暂存的 deferred，再去阻塞等新输入
     def wait(self):                                       
         while self.deferred:
             line = self.deferred.pop(0)
@@ -113,7 +64,6 @@ class Steering():
                 continue
             return [{"role":"user","content":line}]
 
-    # 对终端输入的语言进行分类处理
     def _classify(self,line):
         if line.lower() in ("quit","exit","q"):
             return "quit"
@@ -123,7 +73,6 @@ class Steering():
             return "msg" 
 
     def _run_command(self,line):
-        # 没有会话树
         cmd = line.strip().lower()
         if cmd == "/branch":
             name=self.context.tree.branch()
@@ -156,7 +105,7 @@ class Steering():
             new_tree = self.repo.open(name)
             self.context.tree = new_tree
         elif cmd.startswith("/fork"):
-            # 新开一个对话可以保留原来的历史记录 有点像github里面的fork
+            # fork：把源会话的历史复制过来
             name = cmd[6:].strip()
             if not name:
                 print("/fork 指令缺少名字")
@@ -180,7 +129,6 @@ class Steering():
             print(f"未知命令{line}")
 
 
-# ==================== 4. 事件打印器 ====================
 def make_printer():
     def emit(event):
         t = event["type"]
@@ -207,13 +155,12 @@ def make_printer():
             print(event["content"], end="", flush=True)
     return emit
 
-# ==================== 5. 跑起来 ====================
 def run_scenario(title, prompts, config, context):
     print(f"===== {title} =====")
     transcript = run_agent_loop(
         prompts, context, config,
         make_printer(),
-        StreamFn,
+        stream_deepseek,
     )
     print(f"----- 完整转录（{len(transcript)} 条消息）-----")
     for m in transcript:
@@ -227,24 +174,23 @@ def run_scenario(title, prompts, config, context):
 
 
 
-# 主程序
 if __name__ == "__main__":
-    # 是一个Agenttool的列表
-    tools = [make_add_tool(), make_multiply_tool()]
-    repo = SessionRepo("sessions")
+    init_retriever("rag/index")
+    tool_list = get_tools()
+    conn = get_conn()
+    init_schema(conn)          # 首次运行先建表
+    repo = SqlRepo(conn)
     session = repo.list()
     if not session:
         tree = repo.create_tree("default")
         prompts = [{"role":"user","content":"计算1+2和3*4"}]
         print("首次运行，默认对话为default")
     else:
-        # 找到最新的会话，打开它
         session.sort(key = lambda s:s["createdAt"],reverse=True)
         newset = session[0]["name"]
         tree = repo.open(newset)
         prompts = []
-    ctx_a = AgentContext(system_prompt="你是计算机，能用工具就用工具",tools=tools,tree=tree)
-    # ---- 场景 A：REPL —— agent 答完会停下等你输入，quit 结束 ----
+    ctx_a = AgentContext(system_prompt="你是计算机，能用工具就用工具",tools=tool_list,tree=tree)
     class ConfigA(AgentLoopconfig):
         def __init__(self):
             self.steering = Steering(ctx_a,repo=repo)
@@ -252,7 +198,7 @@ if __name__ == "__main__":
                 model="deepseek-chat",
                 get_steering_messages=self.steering,      # 干活时：非阻塞轮询有没有新输入
                 wait_for_steering=self.steering.wait,     # 答完后：阻塞等你的下一条输入
-                tool_execution="parallel",         # 串行
+                tool_execution="parallel",         # 无依赖的工具可并行；整批里有 sequential 工具时会自动降级
             )
 
     run_scenario(
@@ -261,3 +207,4 @@ if __name__ == "__main__":
         config=ConfigA(),
         context=ctx_a,
     )
+    conn.close()

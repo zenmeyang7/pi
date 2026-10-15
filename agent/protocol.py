@@ -1,16 +1,21 @@
-# type.py
+"""协议层：agent 里流动的数据长什么样，以及怎么跟大模型说话。"""
 from typing import List, Dict, Callable, Optional, Iterable
 import json
+import time
 import urllib.request
-from jsonl_tree import JsonlTree
+import urllib.error
+
+# 网络层参数：urlopen 不设 timeout 会一直挂着（默认无超时），agent 就假死了。
+HTTP_TIMEOUT = 60          # 单次请求读超时（秒）
+MAX_RETRIES = 2            # 失败后最多再试几次
+RETRY_STATUS = {408, 409, 429, 500, 502, 503, 504}   # 值得重试的状态码
+RETRY_BASE_DELAY = 0.5     # 退避基数（秒），第 n 次等 0.5 * 2^n
 # 一条消息（wire format）：{"role","content","tool_calls"?,"tool_call_id"?,"stop_reason"?}
-# 定义消息的格式 "str":object
 AgentMessage = Dict[str, object]
 Message = Dict[str, object]
 AssistantMessage = Dict[str, object]
 ToolResultMessage = Dict[str, object]
 # 事件也是 dict：{"type": ..., ...}
-# 定义事件的格式 "type":pbject
 AgentEvent = Dict[str, object]
 ToolCall = Dict[str, object]  # OpenAI 的 tool call 块
 
@@ -18,13 +23,12 @@ AgentEventSink = Callable[[AgentEvent], None]
 StreamFn = Callable[[str, Dict, Dict], Iterable[AgentEvent]]
 
 
-# ================= AgentTool =================
 class AgentTool:
     """可执行工具：definition 给 LLM 看，execute 给我们执行。"""
 
     def __init__(self, name: str, execute, definition: Optional[Dict] = None, execution_mode: str = "parallel"):
         self.name = name
-        self.execute = execute  # fn(tool_call_id: str, args: dict) -> str
+        self.execute = execute  # fn(args: dict) -> str（str 也接受，工具层统一转错误消息）
         self.execution_mode = execution_mode
         self.definition = definition or {
             "type": "function",
@@ -32,7 +36,6 @@ class AgentTool:
         }
 
 
-# ================= AgentContext =================
 class AgentContext:
     def __init__(self, system_prompt: str = "", messages:Optional[List]=None, tools: Optional[List] = None,tree = None):
         self.system_prompt = system_prompt
@@ -44,7 +47,6 @@ class AgentContext:
             self.tree.append(message=m)
         self.messages.append(m)
 
-# ================= convert_to_llm =================
 def convert_to_llm_default(messages: List[AgentMessage]) -> List[Message]:
     """AgentMessage -> Message：只留 LLM 协议认识的三张牌，并剥掉多余键。"""
     out: List[Message] = []
@@ -61,7 +63,6 @@ def convert_to_llm_default(messages: List[AgentMessage]) -> List[Message]:
     return out
 
 
-# ================= AgentLoopconfig =================
 class AgentLoopconfig:
     def __init__(
         self,
@@ -70,28 +71,66 @@ class AgentLoopconfig:
         wait_for_steering: Optional[Callable[[], List]] = None,
         convert_to_llm=None,
         tool_execution: str = "sequential",
+        max_turns: int = 25,
+        before_tool_call:Optional[Callable[[],List]] = None,
+        after_tool_call:Optional[Callable[[],List]] = None
     ):
         self.model = model
         self.get_steering_messages = get_steering_messages or (lambda: [])
         self.wait_for_steering = wait_for_steering or (lambda: [])
         self.convert_to_llm = convert_to_llm or convert_to_llm_default
         self.tool_execution = tool_execution
+        # 一个"任务"最多跑多少轮工具循环。0 或 None 表示不限（不推荐）。
+        self.max_turns = max_turns
+        self.before_tool_call = before_tool_call
+        self.after_tool_call  = after_tool_call
 
 
-# ================= 工具函数 =================
 def map_stop_reason(finish_reason: str) -> str:
     # 未知的 finish_reason 当作 error 而非 stop：宁可让上层报错，不要误判成正常结束
     return {"stop": "stop", "tool_calls": "toolUse", "length": "length"}.get(finish_reason, "error")
 
 
-# ================= StreamFn（同步生成器，永不抛错）=================
-def StreamFn(model: str, llm_context: Dict, option: Dict):
-    """调 LLM，yield 一个 done/error 事件。任何异常都转成 error 事件，不抛出。"""
+def stream_deepseek(model: str, llm_context: Dict, option: Dict):
+    """调 LLM，yield delta / done / error 事件。任何异常都转成 error 事件，不抛出。
+
+    分成两层：
+      - `_stream_once`：真的发一次请求、逐块解析 SSE；
+      - `stream_deepseek`：在外面包一层重试。
+
+    重试有个前提：**只有在一个字都还没吐出来时才重来**。已经 yield 过 delta
+    就绝不再试——否则用户会在终端上看到两段拼在一起的重复回答。
+
+    这里的名字不能叫 StreamFn：那是文件开头定义的**类型别名**，同名函数会把它
+    覆盖掉，让所有 `x: StreamFn` 注解实际指向这个函数对象。
+    """
+    attempts = int(option.get("max_retries", MAX_RETRIES)) + 1
+    for attempt in range(attempts):
+        emitted_delta = False
+        failure = None
+        for event in _stream_once(model, llm_context, option):
+            if event["type"] == "error":
+                failure = event
+                break
+            if event["type"] == "delta":
+                emitted_delta = True
+            yield event
+        if failure is None:
+            return
+        if emitted_delta or not failure.get("retryable") or attempt == attempts - 1:
+            yield failure               # 吐过字 / 不值得重试 / 次数用尽 → 老实报错
+            return
+        time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+
+
+def _stream_once(model: str, llm_context: Dict, option: Dict):
+    """发一次请求：手写 urllib + SSE 逐行解析。异常全部转成 error 事件。"""
     system = llm_context["system_prompt"]
     messages = llm_context["messages"]
     tools = llm_context["tools"]
     api_key = option.get("api_key")
     base_url = option.get("base_url")
+    timeout = option.get("timeout", HTTP_TIMEOUT)
     body = {
         "model": model,
         "messages": [{"role": "system", "content": system}, *messages],
@@ -107,9 +146,12 @@ def StreamFn(model: str, llm_context: Dict, option: Dict):
     tool_calls = []
     stop_reason = None
     try:
-        with urllib.request.urlopen(req) as resp:
+        # timeout 必须显式传（见上面 HTTP_TIMEOUT）：默认无超时，网络一挂就永远卡住
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             for raw in resp:
-                line = raw.decode().strip()
+                # SSE 流是 UTF-8：不显式指定的话 Windows 会用 GBK 解码，
+                # 中文回答直接 UnicodeDecodeError
+                line = raw.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data:"):
                     continue
                 data = line[len("data:"):].strip()
@@ -151,15 +193,28 @@ def StreamFn(model: str, llm_context: Dict, option: Dict):
                     "stop_reason": reason,
                 },
             }
+    except urllib.error.HTTPError as e:
+        # 4xx 里只有 408/409/429 值得重试；400/401/403 重试一万次也是同样的错
+        yield _error_event(full_content, tool_calls, e,
+                           retryable=e.code in RETRY_STATUS, status=e.code)
     except Exception as e:
-        yield {
-            "type": "error",
-            "reason": "error",
-            "message": {
-                "role": "assistant",
-                "content": full_content,
-                "tool_calls": tool_calls,
-                "stop_reason": "error",
-                "error_message": str(e),
-            },
-        }
+        # 网络类错误（超时 / DNS / 连接重置）一律可重试
+        yield _error_event(full_content, tool_calls, e, retryable=True, status=None)
+
+
+def _error_event(full_content: str, tool_calls: list, exc: Exception,
+                 retryable: bool, status: Optional[int]) -> AgentEvent:
+    """把异常包成统一的 error 事件：形状固定，上层只认 type/error_message。"""
+    return {
+        "type": "error",
+        "reason": "error",
+        "retryable": retryable,
+        "status": status,
+        "message": {
+            "role": "assistant",
+            "content": full_content,
+            "tool_calls": tool_calls,
+            "stop_reason": "error",
+            "error_message": str(exc),
+        },
+    }

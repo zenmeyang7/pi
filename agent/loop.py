@@ -1,22 +1,35 @@
-# agent的执行流程 —— 同步版，消息一律 dict（OpenAI wire format）
+"""Agent 循环：外层管会话生命周期，内层跑工具轮次。
+
+退出靠两个哨位：没有待处理的用户消息、且上一轮没有工具调用 —— 模型不会对
+assistant 消息再做回复，所以没人再问时必须停下，否则它会自己续写下去。
+
+工具执行分串行 / 并行两条路径；上下文超限时先压缩再送进模型。
+"""
 import json
 import os
-from type import AgentContext, AgentEventSink, AgentLoopconfig, StreamFn
-from context_manager import count_context_tokens,compact_context,MAX_TOKENS,count_token,count_message_tokens
+from agent.protocol import AgentContext, AgentEventSink, AgentLoopconfig, StreamFn
+from agent.context import count_context_tokens, compact_context, MAX_TOKENS
+from concurrent.futures import ThreadPoolExecutor, Future
+
+TOOL_WORKERS = 2
+DEFAULT_MAX_TURNS = 25
+
+
 def run_loop(context: AgentContext, newmessages: list, config: AgentLoopconfig,
              emit: AgentEventSink, streamfunction: StreamFn):
     currentContext = context
     pendingMessages = config.get_steering_messages() or []
+    max_turns = getattr(config, "max_turns", None) or DEFAULT_MAX_TURNS
+    turns = 0
 
-    # 外层循环：agent 该停了但还有 steering/follow-up 进来 → 继续
+    # 外层：agent 该停了但又有 steering / follow-up 进来 → 继续
     while True:
         has_more_tool_calls = True
 
-        # 内层循环：工具调用轮次
+        # 内层：工具调用轮次
         while has_more_tool_calls or pendingMessages:
-            # 先去看用户有没有额外的输入
             if pendingMessages:
-                # 内部的存储结构现在是一个树，就需要把消息 append 到树里，append_message内部就会判断树是不是仍然存在，如果不存在就直接append到messages里
+                # 落库到会话树；没有树时退回 context.messages
                 for m in pendingMessages:
                     emit({"type": "message_start", "message": m})
                     emit({"type": "message_end", "message": m})
@@ -24,10 +37,20 @@ def run_loop(context: AgentContext, newmessages: list, config: AgentLoopconfig,
                     newmessages.append(m)
                 pendingMessages = []
 
-            # 调用 LLM，得到一个 assistant 消息 dict
+            # 协议守卫：历史最后一条若已是 assistant（agent 已答完，没人再问），
+            # 这轮就不调模型，直接去等用户输入。否则模型会自己续写、把历史搞脏。
+            history = currentContext.tree.for_path() if currentContext.tree else currentContext.messages
+            if not pendingMessages and history and history[-1]["role"] == "assistant":
+                break
+
+            # 轮次上限：模型若陷入"反复调同一个工具"会一直转下去，
+            # 这里打断本轮并交还控制权给用户（他可以 /back 回溯或换个说法）。
+            if turns >= max_turns:
+                emit({"type": "turn_limit_exceeded", "turns": turns, "maxTurns": max_turns})
+                break
+
             message = streamAssistantResponse(currentContext,config, emit, streamfunction)
-            # 得到一条新消息
-            
+            turns += 1
             newmessages.append(message)
 
             # error / aborted：统一收尾，把错误消息带回去
@@ -35,14 +58,14 @@ def run_loop(context: AgentContext, newmessages: list, config: AgentLoopconfig,
                 emit({"type": "turn_end", "message": message, "toolResults": []})
                 emit({"type": "agent_end", "messages": newmessages})
                 return newmessages
-            # 查看返回的消息里面有无工具的调用
+
             tool_calls = message.get("tool_calls") or []
             tool_results = []
-            has_more_tool_calls = False   # 默认这轮结束
+            has_more_tool_calls = False
             if tool_calls:
-                # 处理工具调用，如果是 length 截断保护 → 不执行，直接报错；否则执行工具调用 超出token限制
                 if message.get("stop_reason") == "length":
-                    # 截断保护：不执行，全部报错，模型下一轮自己重发
+                    # 截断保护：参数可能已被截断，一律不执行、全部报错，
+                    # 让模型下一轮带上完整参数重发 —— 半截参数写文件比不写更糟
                     for tc in tool_calls:
                         tool_results.append({
                             "role": "tool",
@@ -52,7 +75,6 @@ def run_loop(context: AgentContext, newmessages: list, config: AgentLoopconfig,
                                        "arguments may be truncated. Re-issue with complete arguments.",
                         })
                 else:
-                    # 正常执行：整个工具批次跑一遍，返回 tool_result 消息列表 处理的是大模型返回的最新消息
                     executed = executeToolCalls(currentContext, message, config, emit)
                     tool_results = executed["messages"]
                 has_more_tool_calls = True   # 有工具调用 → 至少还要一轮
@@ -64,7 +86,7 @@ def run_loop(context: AgentContext, newmessages: list, config: AgentLoopconfig,
 
             emit({"type": "turn_end", "message": message, "toolResults": tool_results})
 
-            # 每轮结束后轮询 steering（用户可能打字了）
+            # 每轮结束后轮询 steering（用户可能已经打字了）
             pendingMessages = config.get_steering_messages() or []
 
         # 内层退出：agent 暂时没有更多动作了。
@@ -83,7 +105,6 @@ def run_agent_loop(prompts: list, context: AgentContext, config: AgentLoopconfig
     currentContext = context
     emit({"type": "agent_start"})
     emit({"type": "turn_start"})
-    # 这段是看有没有程序里面写的
     for prompt in prompts:
         emit({"type": "message_start", "message": prompt})
         emit({"type": "message_end", "message": prompt})
@@ -92,33 +113,46 @@ def run_agent_loop(prompts: list, context: AgentContext, config: AgentLoopconfig
     return newMessages
 
 
-def run_agent_loop_continue():
-    # agent 发现错误需要重试：context 里已有 user/toolResult，不追加新消息直接跑
-    raise NotImplementedError("复制 run_agent_loop 但跳过 prompts 注入；且最后一条必须是 user/toolResult")
+def run_agent_loop_continue(context: AgentContext, config: AgentLoopconfig,
+                            emit: AgentEventSink, streamFn: StreamFn) -> list:
+    """错误重试 / 续跑入口：不再注入新的 prompt，直接用 context 里已有的历史接着跑。
+
+    和 run_agent_loop 的唯一区别就是「跳过 prompts 注入」。
+    前置条件：历史最后一条不能是 assistant —— 否则协议守卫会立刻跳过模型调用，
+    跑了个寂寞。这是调用方误用（不是运行时异常），所以直接抛。
+    """
+    history = context.tree.for_path() if context.tree else context.messages
+    if history and history[-1].get("role") == "assistant":
+        raise ValueError(
+            "run_agent_loop_continue 要求历史尾部是 user/tool；"
+            "当前是 assistant，模型没有新输入可回复（协议守卫会直接跳过）。"
+        )
+    newMessages = []
+    emit({"type": "agent_start"})
+    emit({"type": "turn_start"})
+    return run_loop(context, newMessages, config, emit, streamFn)
 
 
 def streamAssistantResponse(context: AgentContext, config: AgentLoopconfig,
                             emit: AgentEventSink, streamFuction: StreamFn):
     # AgentMessage -> Message（只留 user/assistant/tool 并剥掉多余键）
-    tree = context.tree # 存储的历史消息
+    tree = context.tree
     history = tree.for_path() if tree else context.messages
     history = config.convert_to_llm(history)
     options = {
             "api_key": os.getenv("DEEPSEEK_API_KEY"),
             "base_url": os.getenv("DEEPSEEK_BASE_URL"),
         }
-    # 压缩上下文，用最大token和最近消息数限制
+    # 超限时压缩：保留最近若干条，把更早的交给模型总结成一段摘要
     system_prompt,llmessages = compact_context(context.system_prompt,history,context.tools,MAX_TOKENS,options["api_key"],options["base_url"])
     llm_context = {
         "system_prompt": system_prompt,
         "messages": llmessages,
         "tools": context.tools,
     }
-    # 计算本轮调用消耗的token数
     tokens = count_context_tokens(system_prompt,llmessages,context.tools)
-    # 消费 StreamFn 的事件流，在 done/error 处摘出裸消息（去掉 message 壳）
+    # 消费 StreamFn 的事件流，在 done / error 处摘出裸消息（去掉 message 壳）
     finalmessage = None
-    # 找到大模型返回的最终一条消息
     for event in streamFuction(config.model, llm_context, options):
         if event["type"] in ("done", "error"):
             finalmessage = event["message"]
@@ -131,85 +165,114 @@ def streamAssistantResponse(context: AgentContext, config: AgentLoopconfig,
     return finalmessage
 
 
-# 工具的执行，分发到顺序 / 并行两条路径
 def executeToolCalls(currentContext: AgentContext, assistant_message: dict,
                      config: AgentLoopconfig, emit: AgentEventSink):
-    # 需要调用的工具
     tool_calls = assistant_message.get("tool_calls") or []
-    # 是否串行
-    has_sequential = False 
+    # 只要这批里有一个工具声明了 sequential，整批降级为串行：
+    # 写操作一旦和读操作并行，"写文件再读回来"就会读到旧内容
+    has_sequential = False
     for tc in tool_calls:
-        # 找到当前需要调用的工具
         name = tc.get("function", {}).get("name")
-        # 判断我注册的工具里面有没有
         target_tool = next((t for t in currentContext.tools if t.name == name), None)
-        # 如果有，并且是串行模式，就标记为串行
         if target_tool and target_tool.execution_mode == "sequential":
             has_sequential = True
             break
-    # 如果有任何一个工具是串行模式，就走顺序执行，否则走并行执行
     if config.tool_execution == "sequential" or has_sequential:
         return executeToolCallsSequential(currentContext, tool_calls, config, emit)
     return executeToolCallsParallel(currentContext, tool_calls, config, emit)
 
 
-# 顺序：一个一个调用工具
 def executeToolCallsSequential(currentContext: AgentContext, tool_calls: list,
                                config: AgentLoopconfig, emit: AgentEventSink):
     messages = []
     for tool_call in tool_calls:
-        # 找到需要调用的工具的id和name，发出开始事件
         tool_call_id = tool_call["id"]
         name = tool_call.get("function", {}).get("name")
         emit({"type": "tool_execution_start", "toolCallId": tool_call_id,
               "toolName": name, "args": tool_call.get("function", {}).get("arguments")})
 
-        # 准备（找工具 + 解析参数）→ 执行（捕获异常）
-        preparation = prepareToolCall(currentContext, tool_call)
+        preparation = prepareToolCall(currentContext, tool_call,config)
         if preparation["kind"] == "immediate":
             content, is_error = preparation["result"], preparation["isError"]
-        else:# 工具已经准备好了
+        else:
             executed = executePreparedToolCall(preparation, emit)
+            executed = finalizeExecutedToolCall(name,executed,config)
             content, is_error = executed["result"], executed["isError"]
-        # content 是工具的返回结果，is_error 是是否出错
         emit({"type": "tool_execution_end", "toolCallId": tool_call_id,
               "toolName": name, "result": content, "isError": is_error})
         messages.append(createToolResultMessage(tool_call_id, name, content, is_error))
     return {"messages": messages, "terminate": False}
 
 
-# 并行：目前退化成顺序（真正的并发 = concurrent.futures，是后续话题）
-def executeToolCallsParallel(currentContext: AgentContext, tool_calls: list,
-                             config: AgentLoopconfig, emit: AgentEventSink):
-    return executeToolCallsSequential(currentContext, tool_calls, config, emit)
+def executeToolCallsParallel(currentContext: AgentContext, tool_calls, config, emit):
+    messages = []
+    # results 严格按「提交顺序」保存：慢的先跑完也不会抢到前面去。
+    # 每一项统一是 (tool_call_id, name, payload)，payload 要么是 Future，
+    # 要么是已经确定的 (content, is_error) 二元组 —— 统一形状才不会在解包时炸。
+    results = []
+    with ThreadPoolExecutor(max_workers=TOOL_WORKERS) as executor:
+        for tc in tool_calls:
+            name = tc.get("function", {}).get("name")        # ← 不是 tc["name"]！
+            args = tc.get("function", {}).get("arguments")
+            emit({"type": "tool_execution_start", "toolCallId": tc["id"],
+                  "toolName": name, "args": args})
+            preparation = prepareToolCall(currentContext, tc,config)
+            if preparation["kind"] == "immediate":
+                # 工具不存在 / 参数非法 / 被 before_tool_call 拦下：不用提交，结果已定
+                results.append((tc["id"], name,
+                                (preparation["result"], preparation["isError"])))
+            else:
+                fut = executor.submit(executePreparedToolCall, preparation, emit)
+                results.append((tc["id"], name, fut))
+        for tid, name, payload in results:                    # 按原序收
+            if isinstance(payload, Future):
+                executed = finalizeExecutedToolCall(name, payload.result(), config)
+                content, is_error = executed["result"], executed["isError"]
+            else:
+                content, is_error = payload
+            emit({"type": "tool_execution_end", "toolCallId": tid,
+                  "toolName": name, "result": content, "isError": is_error})
+            messages.append(createToolResultMessage(tid, name, content, is_error))
+    return {"messages": messages, "terminate": False}
 
 
-# 准备工具 + 校验参数
-def prepareToolCall(currentContext: AgentContext, tool_call: dict) -> dict:
-    # 从currentContext的tools里面检查是不是有对应的工具
+def prepareToolCall(currentContext: AgentContext, tool_call: dict,config:AgentLoopconfig) -> dict:
     name = tool_call.get("function", {}).get("name")
     tool = next((t for t in currentContext.tools if t.name == name), None)
     if not tool:
         return {"kind": "immediate", "result": f"Tool {name} not found", "isError": True}
+    raw_args = tool_call.get("function", {}).get("arguments")
     try:
-        args = json.loads(tool_call.get("function", {}).get("arguments") or "{}")
+        args = json.loads(raw_args or "{}")
     except Exception as e:
         return {"kind": "immediate", "result": f"Invalid arguments: {e}", "isError": True}
+    if not isinstance(args, dict):
+        return {"kind": "immediate", "result": f"Invalid arguments: expected object, got {type(args).__name__}",
+                "isError": True}
+    if config.before_tool_call:
+        res = config.before_tool_call(name,args)
+        if res and res.get("block"):
+            return {"kind":"immediate","result":res["reason"],"isError":True}
     return {"kind": "prepared", "tool": tool, "args": args, "tool_call_id": tool_call["id"]}
 
 
-# 真正的调用工具：错误转成文本，永不抛
+# 工具抛的异常一律转成文本结果：工具出错不该让整个 agent 循环崩掉
 def executePreparedToolCall(prepared: dict, emit: AgentEventSink) -> dict:
     try:
-        result = prepared["tool"].execute(prepared["tool_call_id"], prepared["args"])
+        result = prepared["tool"].execute(prepared["args"])
         return {"result": result, "isError": False}
     except Exception as e:
         return {"result": f"ERROR: {e}", "isError": True}
 
 
-# 允许改写结果（afterToolCall 钩子）：最小版跳过，留扩展点
-def finalizeExecutedToolCall():
-    pass
+# after_tool_call 钩子：允许改写工具结果
+def finalizeExecutedToolCall(name,outcome,config):
+    if not config.after_tool_call:
+        return outcome
+    res = config.after_tool_call(name,outcome["result"],outcome["isError"])
+    if not res:
+        return outcome
+    return {"result":res.get("result",outcome["result"]),"isError":res.get("isError",outcome["isError"])}
 
 
 # 包装成一条"工具结果消息"（wire format）

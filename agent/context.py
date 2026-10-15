@@ -1,8 +1,7 @@
-# 上下文管理
-# 写token计数器
+"""上下文计量与压缩：tiktoken 数 token，超限时把早期消息总结成一段摘要。"""
 import tiktoken
 import json
-from type import StreamFn
+from agent.protocol import stream_deepseek
 _enc = tiktoken.get_encoding("cl100k_base")
 def count_token(text:str)->int:
     if not text:
@@ -45,7 +44,7 @@ def summarize(messages,api_key,base_url)->str:
             "base_url": base_url,
         }
     final_message = ""
-    for event in StreamFn(model,llm_context,options):
+    for event in stream_deepseek(model,llm_context,options):
         if event["type"] in ["done","error"]:
             final_message = event["message"]["content"]
     return final_message
@@ -62,9 +61,3 @@ def compact_context(system_prompt,messages,tools,max_tokens,api_key,base_url):
     summary = summarize(old,api_key,base_url)
     new_system = system_prompt+"\n\n[旧对话摘要]\n" +summary
     return (new_system,recent)
-
-if __name__ == "__main__":
-    # 模拟一条 user 消息 + 一个 add 工具定义，看总数是否合理增长
-    msgs = [{"role": "user", "content": "计算1+2和3*4"}]
-    tool_def = {"type": "function", "function": {"name": "add", "parameters": {"type": "object", "properties": {}}}}
-    print(count_context_tokens("你是计算器", msgs, [{"definition": tool_def}]))
