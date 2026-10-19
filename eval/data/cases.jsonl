@@ -1,11 +1,12 @@
-{"query": "compact_context 函数怎么压缩超限的上下文", "path": "agent/context.py", "lines": [54, 63], "category": "function_location"}
-{"query": "executeToolCallsParallel 怎么保证结果按提交顺序收集", "path": "agent/loop.py", "lines": [207, 236], "category": "function_location"}
+{"query": "compact_context 函数怎么压缩超限的上下文", "path": "agent/context.py", "lines": [61, 70], "category": "function_location"}
+{"query": "executeToolCallsParallel 怎么保证结果按提交顺序收集", "path": "agent/loop.py", "lines": [207, 234], "category": "function_location"}
 {"query": "map_stop_reason 遇到未知 finish_reason 返回什么", "path": "agent/protocol.py", "lines": [89, 91], "category": "function_location"}
 {"query": "safe_path 用 commonpath 做了什么校验", "path": "tools/files.py", "lines": [5, 13], "category": "function_location"}
 {"query": "rrf 函数怎么融合多路召回结果", "path": "rag/store.py", "lines": [253, 272], "category": "function_location"}
-{"query": "tokenize 怎么把 camelCase 和下划线拆开", "path": "rag/store.py", "lines": [16, 26], "category": "function_location"}
+{"query": "tokenize 怎么把 camelCase 和下划线拆开", "path": "rag/store.py", "lines": [19, 22], "category": "function_location"}
 {"query": "AgentContext 这个类管理哪些数据", "path": "agent/protocol.py", "lines": [40, 48], "category": "class_responsibility"}
 {"query": "AgentTool 的 definition 和 execute 分别干什么的", "path": "agent/protocol.py", "lines": [29, 36], "category": "class_responsibility"}
+
 {"query": "AgentLoopconfig 能配置哪些行为", "path": "agent/protocol.py", "lines": [67, 86], "category": "class_responsibility"}
 {"query": "BM25 类是怎么给文档打分的", "path": "rag/store.py", "lines": [37, 68], "category": "class_responsibility"}
 {"query": "Steering 类的轮询和阻塞等待有什么区别", "path": "main.py", "lines": [36, 65], "category": "class_responsibility"}

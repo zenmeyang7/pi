@@ -22,7 +22,7 @@ def iter_files(root):
             try:
                 if os.path.getsize(p) > config.INDEX_MAX_FILE_BYTES:
                     continue
-            except OSError:            # 文件刚好被删了/没权限：跳过，别中断整个遍历
+            except OSError:           
                 continue
             yield p
 

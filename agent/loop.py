@@ -6,11 +6,11 @@ assistant 消息再做回复，所以没人再问时必须停下，否则它会�
 工具执行分串行 / 并行两条路径；上下文超限时先压缩再送进模型。
 """
 import json
-import os
 from agent.protocol import AgentContext, AgentEventSink, AgentLoopconfig, StreamFn
-from agent.context import count_context_tokens, compact_context, MAX_TOKENS
+from agent.context import context_pressure
+from agent.llm import options as llm_options, model as llm_model
 from concurrent.futures import ThreadPoolExecutor, Future
-
+from typing import List
 TOOL_WORKERS = 2
 DEFAULT_MAX_TURNS = 25
 
@@ -38,18 +38,16 @@ def run_loop(context: AgentContext, newmessages: list, config: AgentLoopconfig,
                 pendingMessages = []
 
             # 协议守卫：历史最后一条若已是 assistant（agent 已答完，没人再问），
-            # 这轮就不调模型，直接去等用户输入。否则模型会自己续写、把历史搞脏。
             history = currentContext.tree.for_path() if currentContext.tree else currentContext.messages
             if not pendingMessages and history and history[-1]["role"] == "assistant":
                 break
 
             # 轮次上限：模型若陷入"反复调同一个工具"会一直转下去，
-            # 这里打断本轮并交还控制权给用户（他可以 /back 回溯或换个说法）。
             if turns >= max_turns:
                 emit({"type": "turn_limit_exceeded", "turns": turns, "maxTurns": max_turns})
                 break
 
-            message = streamAssistantResponse(currentContext,config, emit, streamfunction)
+            message = streamAssistantResponse(currentContext,config,history,emit, streamfunction)
             turns += 1
             newmessages.append(message)
 
@@ -133,27 +131,32 @@ def run_agent_loop_continue(context: AgentContext, config: AgentLoopconfig,
     return run_loop(context, newMessages, config, emit, streamFn)
 
 
-def streamAssistantResponse(context: AgentContext, config: AgentLoopconfig,
+def streamAssistantResponse(context: AgentContext, config: AgentLoopconfig,history:List,
                             emit: AgentEventSink, streamFuction: StreamFn):
+    raw_history = history          # 保留 id，压缩写回时要定位 keep_from
     # AgentMessage -> Message（只留 user/assistant/tool 并剥掉多余键）
-    tree = context.tree
-    history = tree.for_path() if tree else context.messages
     history = config.convert_to_llm(history)
-    options = {
-            "api_key": os.getenv("DEEPSEEK_API_KEY"),
-            "base_url": os.getenv("DEEPSEEK_BASE_URL"),
-        }
-    # 超限时压缩：保留最近若干条，把更早的交给模型总结成一段摘要
-    system_prompt,llmessages = compact_context(context.system_prompt,history,context.tools,MAX_TOKENS,options["api_key"],options["base_url"])
+    options = llm_options()
+    model = config.model or llm_model()
+    # 超限时压缩：保留最近若干条，把更早的交给模型总结成一段摘要。
+    # 上一轮的摘要从树里读，压缩结果再写回成 checkpoint。
+    previous_summary = context.tree.latest_summary() if context.tree else ""
+    system_prompt,llmessages,summary = context_pressure(
+        context.system_prompt,history,context.tools,
+        options["api_key"],options["base_url"],
+        previous_summary=previous_summary)
+    if summary and context.tree:
+        # 压缩后的消息是原历史的尾部，用第一条的 id 标记"从这里往后保留"
+        keep_from = raw_history[-len(llmessages)]["id"] if llmessages else None
+        context.tree.append_compaction(summary, keep_from)
     llm_context = {
         "system_prompt": system_prompt,
         "messages": llmessages,
         "tools": context.tools,
     }
-    tokens = count_context_tokens(system_prompt,llmessages,context.tools)
     # 消费 StreamFn 的事件流，在 done / error 处摘出裸消息（去掉 message 壳）
     finalmessage = None
-    for event in streamFuction(config.model, llm_context, options):
+    for event in streamFuction(model, llm_context, options):
         if event["type"] in ("done", "error"):
             finalmessage = event["message"]
         elif event["type"] == "delta":
@@ -193,11 +196,13 @@ def executeToolCallsSequential(currentContext: AgentContext, tool_calls: list,
 
         preparation = prepareToolCall(currentContext, tool_call,config)
         if preparation["kind"] == "immediate":
-            content, is_error = preparation["result"], preparation["isError"]
+            executed = {"result": preparation["result"], "isError": preparation["isError"]}
         else:
             executed = executePreparedToolCall(preparation, emit)
-            executed = finalizeExecutedToolCall(name,executed,config)
-            content, is_error = executed["result"], executed["isError"]
+        # immediate（工具不存在 / 参数非法 / 被 before 拦下）也要过钩子：
+        # 审计不能漏掉"尝试了但没执行成功"的调用
+        executed = finalizeExecutedToolCall(name,executed,config)
+        content, is_error = executed["result"], executed["isError"]
         emit({"type": "tool_execution_end", "toolCallId": tool_call_id,
               "toolName": name, "result": content, "isError": is_error})
         messages.append(createToolResultMessage(tool_call_id, name, content, is_error))
@@ -226,15 +231,16 @@ def executeToolCallsParallel(currentContext: AgentContext, tool_calls, config, e
                 results.append((tc["id"], name, fut))
         for tid, name, payload in results:                    # 按原序收
             if isinstance(payload, Future):
-                executed = finalizeExecutedToolCall(name, payload.result(), config)
-                content, is_error = executed["result"], executed["isError"]
+                executed = payload.result()
             else:
-                content, is_error = payload
+                executed = {"result": payload[0], "isError": payload[1]}
+            # 钩子统一在主线程的收集阶段跑：Future 结果和 immediate 结果都覆盖
+            executed = finalizeExecutedToolCall(name, executed, config)
+            content, is_error = executed["result"], executed["isError"]
             emit({"type": "tool_execution_end", "toolCallId": tid,
                   "toolName": name, "result": content, "isError": is_error})
             messages.append(createToolResultMessage(tid, name, content, is_error))
     return {"messages": messages, "terminate": False}
-
 
 def prepareToolCall(currentContext: AgentContext, tool_call: dict,config:AgentLoopconfig) -> dict:
     name = tool_call.get("function", {}).get("name")

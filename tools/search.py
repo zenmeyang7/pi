@@ -1,8 +1,5 @@
-"""代码检索工具：把 rag/ 的检索链路包装成一个 AgentTool。
-
-和 tools/files.py 分开的理由是依赖形态不同：read_file / write_file 是纯本地
-IO，随时可用；search_code 要先有一份构建好的向量索引，缺索引时它得能降级
-成一句可操作的提示，而不是直接把会话炸掉。
+"""
+代码检索工具：把 rag/ 的检索链路包装成一个 AgentTool。
 """
 from agent.protocol import AgentTool
 
@@ -41,7 +38,7 @@ def search_code():
         try:
             k = min(int(args.get("k", TOP_K)), 10)
         except (TypeError, ValueError):
-            k = TOP_K    # 模型偶尔把 k 填成非数字，按默认值走而不是报错
+            k = TOP_K    
         if k < 1:
             k = 1
         from rag.retriever import format_hits

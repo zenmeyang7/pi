@@ -5,19 +5,17 @@ import time
 import urllib.request
 import urllib.error
 
-# 网络层参数：urlopen 不设 timeout 会一直挂着（默认无超时），agent 就假死了。
-HTTP_TIMEOUT = 60          # 单次请求读超时（秒）
-MAX_RETRIES = 2            # 失败后最多再试几次
-RETRY_STATUS = {408, 409, 429, 500, 502, 503, 504}   # 值得重试的状态码
-RETRY_BASE_DELAY = 0.5     # 退避基数（秒），第 n 次等 0.5 * 2^n
-# 一条消息（wire format）：{"role","content","tool_calls"?,"tool_call_id"?,"stop_reason"?}
+# 网络层参数
+HTTP_TIMEOUT = 60        
+MAX_RETRIES = 2           
+RETRY_STATUS = {408, 409, 429, 500, 502, 503, 504}   
+RETRY_BASE_DELAY = 0.5     
 AgentMessage = Dict[str, object]
 Message = Dict[str, object]
 AssistantMessage = Dict[str, object]
 ToolResultMessage = Dict[str, object]
-# 事件也是 dict：{"type": ..., ...}
 AgentEvent = Dict[str, object]
-ToolCall = Dict[str, object]  # OpenAI 的 tool call 块
+ToolCall = Dict[str, object]  
 
 AgentEventSink = Callable[[AgentEvent], None]
 StreamFn = Callable[[str, Dict, Dict], Iterable[AgentEvent]]
@@ -72,8 +70,10 @@ class AgentLoopconfig:
         convert_to_llm=None,
         tool_execution: str = "sequential",
         max_turns: int = 25,
-        before_tool_call:Optional[Callable[[],List]] = None,
-        after_tool_call:Optional[Callable[[],List]] = None
+        # before(name, args) -> {"block": bool, "reason": str} | None
+        # after(name, result, isError) -> {"result": ..., "isError": ...} | None
+        before_tool_call: Optional[Callable[[str, dict], Optional[dict]]] = None,
+        after_tool_call: Optional[Callable[[str, object, bool], Optional[dict]]] = None
     ):
         self.model = model
         self.get_steering_messages = get_steering_messages or (lambda: [])
@@ -98,11 +98,6 @@ def stream_deepseek(model: str, llm_context: Dict, option: Dict):
       - `_stream_once`：真的发一次请求、逐块解析 SSE；
       - `stream_deepseek`：在外面包一层重试。
 
-    重试有个前提：**只有在一个字都还没吐出来时才重来**。已经 yield 过 delta
-    就绝不再试——否则用户会在终端上看到两段拼在一起的重复回答。
-
-    这里的名字不能叫 StreamFn：那是文件开头定义的**类型别名**，同名函数会把它
-    覆盖掉，让所有 `x: StreamFn` 注解实际指向这个函数对象。
     """
     attempts = int(option.get("max_retries", MAX_RETRIES)) + 1
     for attempt in range(attempts):
@@ -134,9 +129,14 @@ def _stream_once(model: str, llm_context: Dict, option: Dict):
     body = {
         "model": model,
         "messages": [{"role": "system", "content": system}, *messages],
-        "tools": [t.definition for t in tools],
         "stream": True,
     }
+    if tools:
+        body["tools"] = [t.definition for t in tools]
+    # 采样参数：不传就用服务端默认值，摘要这种要求稳定的调用由上层显式指定
+    for key in ("temperature", "max_tokens", "thinking"):
+        if option.get(key) is not None:
+            body[key] = option[key]
     req = urllib.request.Request(
         f"{base_url}/chat/completions",
         data=json.dumps(body).encode(),

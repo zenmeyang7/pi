@@ -1,11 +1,12 @@
 # main.py —— 驱动 agent_loop 的 REPL 演示
-# 真实 DeepSeek 模型：agent 算完会停下等你输入下一条，输入 quit 结束。
+# 模型由 .env 的 LLM_MODEL / LLM_BASE_URL 决定（默认 deepseek-flash）。
 import sys
 import queue
 import threading
 from dotenv import load_dotenv
 from agent.loop import run_agent_loop
 from agent.protocol import AgentContext, AgentLoopconfig, AgentTool, stream_deepseek
+from agent.llm import model as llm_model
 from agent.storage import SqlRepo, get_conn, init_schema
 from tools import get_tools
 from tools.search import init_retriever
@@ -13,9 +14,8 @@ from tools.search import init_retriever
 sys.stdout.reconfigure(encoding="utf-8")
 
 load_dotenv(".env")
+
 class Steering():
-    """后台线程读 stdin：__call__ 是"轮询"（agent 干活时非阻塞检查），
-    wait 是"阻塞等待"（agent 答完后停下来等你下一条输入）。"""
     def __init__(self,context,repo):
         self.context = context
         self.repo =repo
@@ -155,6 +155,15 @@ def make_printer():
             print(event["content"], end="", flush=True)
     return emit
 
+def after_tool_call(name, result, is_error):
+    status = "ERROR" if is_error else "OK"
+    preview = str(result).replace("\n", " ")
+    if len(preview) > 80:
+        preview = preview[:80] + "..."
+    print(f"  [after_tool_call] {name} -> {status}: {preview}", file=sys.stderr)
+    return {"result": result, "isError": is_error}
+
+
 def run_scenario(title, prompts, config, context):
     print(f"===== {title} =====")
     transcript = run_agent_loop(
@@ -195,10 +204,11 @@ if __name__ == "__main__":
         def __init__(self):
             self.steering = Steering(ctx_a,repo=repo)
             super().__init__(
-                model="deepseek-chat",
+                model=llm_model(),
                 get_steering_messages=self.steering,      # 干活时：非阻塞轮询有没有新输入
                 wait_for_steering=self.steering.wait,     # 答完后：阻塞等你的下一条输入
                 tool_execution="parallel",         # 无依赖的工具可并行；整批里有 sequential 工具时会自动降级
+                after_tool_call=after_tool_call,   # 每次工具执行后审计（含未执行成功的调用）
             )
 
     run_scenario(

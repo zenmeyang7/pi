@@ -7,27 +7,6 @@
                                 |                          |
                                 +-- 不忠实就拒答？          +-- 论断级：有几条论断能被上下文支持
                                                            +-- 回答级：有没有断言一个答案
-
-三条设计上的取舍，都是踩过坑才这么定的：
-
-① **判官返回计数，不返回 0~1 的分数。** 让模型直接打一个分数，它对什么题都会给你
-   0.8/0.5 这种中庸数，且同一份答案两次给的不一样。改成问"这段回答里有几条论断、
-   其中几条能被上下文支持"，分数我们自己除 —— 结果可加、可复现，而且"两句话的回答
-   拿了满分"这种作弊会在**平均声明数**那一列里现形。
-
-② **拒答用固定串，不靠判官认。** 生成时要求"上下文不够就原样输出 REFUSAL"，
-   于是"有没有拒答"变成一次子串匹配：确定性、免费、可复现。只有**既没拒答、又不像
-   正经作答**的回答才送判官，省掉的调用顺便让 18 条对抗题的头号数字不依赖判官波动。
-
-③ **幻觉率不是一个数。** "语料里根本没有"的题太好拒（拒答线都没设才会错），把它当
-   Hallucination Rate 会显得系统很安全；真正的重灾区是"语料里有很像的素材、但答案
-   不存在"的近义题，以及可解答集上"答了但夹带私货"。所以三项分开报，总分取**宏平均**
-   （等权，不被三者的样本量比带偏）。
-
-⚠️ 本文件会被切进 RAG 语料（eval/ 不在 INDEX_IGNORE_DIRS 里，只按文件名排除了
-   adversarial.py 和 result.md）。所以**注释和 prompt 里都不许出现对抗题的主题词**，
-   缓存文件也因此必须叫 .jsonl —— .json 在 rag/config.py 的 INDEX_EXTENSIONS 里，
-   缓存的内容里必然带着那些主题词，一旦进语料，对抗集就废了。
 """
 import hashlib
 import json
@@ -41,7 +20,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 # 传输层参数：与 agent/protocol.py 保持同一套语义（那边是流式的，这边是一次性请求，
 # 因为判官要 JSON、生成要 temperature=0，而 protocol 的 body 里根本没有 temperature）。
-HTTP_TIMEOUT = 60
+# 本地 4B 模型一次生成（含思考链）比云端慢一个量级，60s 会误判成超时重试。
+HTTP_TIMEOUT = int(os.getenv("LLM_TIMEOUT") or 180)
 MAX_RETRIES = 2
 RETRY_STATUS = {408, 409, 429, 500, 502, 503, 504}
 RETRY_BASE_DELAY = 0.5
@@ -50,7 +30,9 @@ RETRY_BASE_DELAY = 0.5
 # 不作废的后果：新 rubric 下跑出来的报告，一半数字来自旧答案，没人看得出来。
 PROMPT_VERSION = 1
 
-DEFAULT_MODEL = "deepseek-chat"
+# 生成端和判官都用 LLM_MODEL（默认 deepseek-flash）——它必须和 REPL 里那个是同一个：
+# 换了模型名，缓存 key 变了，旧缓存自动作废，不会拿旧答案当新成绩。
+DEFAULT_MODEL = os.getenv("LLM_MODEL") or "deepseek-flash"
 DEFAULT_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "gen_cache.jsonl")
 
 # 固定拒答串：生成端被要求"答不了就原样输出这一行"，检测端子串匹配即可。
@@ -75,13 +57,16 @@ def chat(model, messages, *, api_key=None, base_url=None, temperature=0.0,
     if chat_fn is not None:
         return chat_fn(model, messages, json_object=json_object)
 
-    api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
-    base_url = (base_url or os.getenv("DEEPSEEK_BASE_URL") or "").rstrip("/")
+    api_key = api_key or os.getenv("LLM_API_KEY") or ""
+    base_url = (base_url or os.getenv("LLM_BASE_URL")
+                or "https://api.deepseek.com").rstrip("/")
     if not api_key or not base_url:
-        raise ChatError("缺少 DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL（先 load_dotenv）")
+        raise ChatError("缺少 LLM_API_KEY / LLM_BASE_URL（先 load_dotenv）")
 
+    # 评测要可复现：thinking 开着时 DeepSeek 会忽略 temperature，且带推理开销
     body = {"model": model, "messages": messages,
-            "temperature": temperature, "stream": False}
+            "temperature": temperature, "stream": False,
+            "thinking": {"type": "disabled"}}
     if json_object:
         # 判官走 JSON mode：省掉"从一段散文里抠 JSON"的脆弱环节。
         # 代价是模型不再输出推理过程，但判据本身足够机械，不需要它思考。

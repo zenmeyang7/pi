@@ -11,18 +11,11 @@ RERANK_URL = os.getenv("RAG_RERANK_URL", "http://localhost:8080/v1/rerank")
 RERANK_MODEL = os.getenv("RAG_RERANK_MODEL", "bge-reranker-v2-m3")
 RERANK_ENABLED = os.getenv("RAG_RERANK_ENABLED") == "1"
 RERANK_TIMEOUT = 60
-# 后端：auto（先 llama-server 后 onnx）/ onnx / llama-server / none。
-# onnx 是本地进程内推理，不用起服务也不用 torch——只要 onnxruntime + tokenizers
-# 和一份 ONNX 模型。bge-reranker-base（278M）从魔搭下：
-#   https://www.modelscope.cn/models/BAAI/bge-reranker-base
 RERANK_BACKEND = os.getenv("RAG_RERANK_BACKEND", "auto")
 RERANK_ONNX_DIR = os.getenv("RAG_RERANK_ONNX_DIR", "rag/models/bge-reranker-base")
-# ONNX 推理设备：auto（按 cuda→dml→cpu 顺序尝试，第一个可用胜出）/ cuda / dml / cpu。
-# 有 NVIDIA GPU 时装 onnxruntime-gpu，auto 自动走 CUDAExecutionProvider；
-# 装不上的环境（无 GPU / 只装了 CPU 版 onnxruntime）自动 fallback 到 CPU，不会报错。
+# ONNX 推理设备：auto（按 cuda→dml→cpu 顺序尝试，第一个可用胜出）
 RERANK_PROVIDER = os.getenv("RAG_RERANK_PROVIDER", "auto")
-# 重排批大小：GPU 上 16 吞吐更高（单批摊薄 kernel launch 开销）；
-# 纯 CPU 跑可降到 8（内存吃紧时），可按机器调。
+# 纯 CPU 跑可降到 8
 RERANK_BATCH = int(os.getenv("RAG_RERANK_BATCH", "16"))
 
 # ---------- 切片 ----------

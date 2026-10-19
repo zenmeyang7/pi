@@ -131,7 +131,6 @@ class Retriever:
 
 
 def retrieve(query, store, k=None, reranker=None, embed_fn=None):
-    """无状态便捷入口（每次新建 Retriever，reranker 会重新探活，慎用循环）。"""
     return Retriever(store, reranker, embed_fn).retrieve(query, k=k)
 
 

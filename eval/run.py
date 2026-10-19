@@ -22,7 +22,8 @@ sys.path.insert(0, ROOT)
 # 必须在 import rag.* **之前**：rag.config 是导入时就求值的，
 # 晚一步加载，RAG_RERANK_ENABLED / RAG_RERANK_BACKEND 拿到的还是空值，
 # 于是 reranker 静默降级成 none，重排档被跳过还不知道为什么。
-# agent/config 那边同理：DEEPSEEK_API_KEY 也要在这一步进来，生成档才拿得到。
+# agent/llm.py 同理：LLM_MODEL / LLM_BASE_URL 是函数在调用时才读的，但
+# eval/generation.py 的 DEFAULT_MODEL 是 import 时求值，晚一步就只剩兜底值。
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(ROOT, ".env"))

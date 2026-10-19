@@ -4,7 +4,6 @@ from agent.protocol import AgentTool
 
 def safe_path(path):
     root = os.path.abspath(os.getcwd())
-    # 先 normpath 掉 ../ 之类的花招，再判 commonpath —— 顺序反了就会被绕过
     target = os.path.abspath(os.path.normpath(path))
     try:
         ans = os.path.commonpath([target,root]) == root
