@@ -55,7 +55,6 @@ def write_file():
         safe = safe_path(path=path)
         if safe is None:
             return "该文件不在当前文件夹下，没有权限执行"
-        # 父目录可能还不存在，直接 open 会 FileNotFoundError
         parent = os.path.dirname(safe)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -65,8 +64,6 @@ def write_file():
     return AgentTool(
         name="write_file",
         execute=execute,
-        # 写操作有副作用：和 read_file 同批并行时，"写文件再读回来"会读到旧内容，
-        # 甚至文件还没创建。标 sequential 后整批降级为串行（见 executeToolCalls）。
         execution_mode="sequential",
         definition={
             "type":"function",

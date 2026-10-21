@@ -1,0 +1,14 @@
+
+{
+  "mcpServers": {
+    "filesystem_mcp": {
+      "transport": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "python",
+        "tools/mcp/servers/mcp_server.py"
+      ]
+    }
+  }
+}

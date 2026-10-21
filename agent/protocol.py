@@ -70,10 +70,9 @@ class AgentLoopconfig:
         convert_to_llm=None,
         tool_execution: str = "sequential",
         max_turns: int = 25,
-        # before(name, args) -> {"block": bool, "reason": str} | None
-        # after(name, result, isError) -> {"result": ..., "isError": ...} | None
         before_tool_call: Optional[Callable[[str, dict], Optional[dict]]] = None,
-        after_tool_call: Optional[Callable[[str, object, bool], Optional[dict]]] = None
+        after_tool_call: Optional[Callable[[str, object, bool], Optional[dict]]] = None,
+        tool_selector: Optional[Callable[[List, List], List]] = None
     ):
         self.model = model
         self.get_steering_messages = get_steering_messages or (lambda: [])
@@ -84,6 +83,7 @@ class AgentLoopconfig:
         self.max_turns = max_turns
         self.before_tool_call = before_tool_call
         self.after_tool_call  = after_tool_call
+        self.tool_selector = tool_selector
 
 
 def map_stop_reason(finish_reason: str) -> str:

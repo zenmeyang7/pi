@@ -136,13 +136,16 @@ def streamAssistantResponse(context: AgentContext, config: AgentLoopconfig,histo
     raw_history = history          # 保留 id，压缩写回时要定位 keep_from
     # AgentMessage -> Message（只留 user/assistant/tool 并剥掉多余键）
     history = config.convert_to_llm(history)
+    tools = context.tools
+    if config.tool_selector is not None:
+        tools = config.tool_selector(history, context.tools)
     options = llm_options()
     model = config.model or llm_model()
     # 超限时压缩：保留最近若干条，把更早的交给模型总结成一段摘要。
     # 上一轮的摘要从树里读，压缩结果再写回成 checkpoint。
     previous_summary = context.tree.latest_summary() if context.tree else ""
     system_prompt,llmessages,summary = context_pressure(
-        context.system_prompt,history,context.tools,
+        context.system_prompt,history,tools,
         options["api_key"],options["base_url"],
         previous_summary=previous_summary)
     if summary and context.tree:
@@ -152,7 +155,7 @@ def streamAssistantResponse(context: AgentContext, config: AgentLoopconfig,histo
     llm_context = {
         "system_prompt": system_prompt,
         "messages": llmessages,
-        "tools": context.tools,
+        "tools": tools,
     }
     # 消费 StreamFn 的事件流，在 done / error 处摘出裸消息（去掉 message 壳）
     finalmessage = None

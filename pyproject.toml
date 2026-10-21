@@ -9,6 +9,7 @@ requires-python = ">=3.14"
 dependencies = [
     "dotenv>=0.9.9",
     "langchain-ollama>=1.1.0",
+    "mcp[cli]>=2.3.0",
     "onnxruntime-directml>=1.24.4",
     "pymysql>=1.2.0",
     "ragas>=0.4.3",

@@ -5,11 +5,12 @@ import queue
 import threading
 from dotenv import load_dotenv
 from agent.loop import run_agent_loop
-from agent.protocol import AgentContext, AgentLoopconfig, AgentTool, stream_deepseek
+from agent.protocol import AgentContext, AgentLoopconfig, stream_deepseek
 from agent.llm import model as llm_model
 from agent.storage import SqlRepo, get_conn, init_schema
-from tools import get_tools
-from tools.search import init_retriever
+from tools import build_registry, init_retriever
+from tools.selector import ToolSelector
+
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -144,7 +145,7 @@ def make_printer():
             print(f"  [tool_exec_start] {event['toolName']}({event['args']})")
         elif t == "tool_execution_end":
             status = "OK" if not event["isError"] else "ERROR"
-            print(f"  [tool_exec_end  ] {event['toolName']} -> {status}: {event['result']}")
+            print(f"  [tool_exec_end  ] {event['toolName']} -> {status}")
         elif t == "turn_end":
             n = len(event["toolResults"])
             print(f"  [turn_end     ] 工具结果 {n} 条 -> 推回 context")
@@ -157,10 +158,7 @@ def make_printer():
 
 def after_tool_call(name, result, is_error):
     status = "ERROR" if is_error else "OK"
-    preview = str(result).replace("\n", " ")
-    if len(preview) > 80:
-        preview = preview[:80] + "..."
-    print(f"  [after_tool_call] {name} -> {status}: {preview}", file=sys.stderr)
+    print(f"  [after_tool_call] {name} -> {status}", file=sys.stderr)
     return {"result": result, "isError": is_error}
 
 
@@ -178,18 +176,25 @@ def run_scenario(title, prompts, config, context):
             extra = " tool_calls=" + ",".join(tc["function"]["name"] for tc in m["tool_calls"])
         if m.get("stop_reason"):
             extra += f" stop_reason={m['stop_reason']}"
-        print(f"  {m['role']:>9}: {m.get('content','')}{extra}")
+        content = m.get("content", "")
+        if m["role"] == "tool":
+            content = f"[工具结果已省略：{len(str(content))} 字符]"
+        print(f"  {m['role']:>9}: {content}{extra}")
     print()
 
 
 
 if __name__ == "__main__":
     init_retriever("rag/index")
-    tool_list = get_tools()
     conn = get_conn()
     init_schema(conn)          # 首次运行先建表
     repo = SqlRepo(conn)
     session = repo.list()
+    registry = build_registry(
+        "tools/mcp/config/mcp_server.json",
+        mcp_required=False,
+    )
+    selector = ToolSelector(top_k=3, always_keep={"read_file"})
     if not session:
         tree = repo.create_tree("default")
         prompts = [{"role":"user","content":"计算1+2和3*4"}]
@@ -199,7 +204,7 @@ if __name__ == "__main__":
         newset = session[0]["name"]
         tree = repo.open(newset)
         prompts = []
-    ctx_a = AgentContext(system_prompt="你是计算机，能用工具就用工具",tools=tool_list,tree=tree)
+    ctx_a = AgentContext(system_prompt="你是计算机，能用工具就用工具",tools=registry.list_tools(),tree=tree)
     class ConfigA(AgentLoopconfig):
         def __init__(self):
             self.steering = Steering(ctx_a,repo=repo)
@@ -209,12 +214,17 @@ if __name__ == "__main__":
                 wait_for_steering=self.steering.wait,     # 答完后：阻塞等你的下一条输入
                 tool_execution="parallel",         # 无依赖的工具可并行；整批里有 sequential 工具时会自动降级
                 after_tool_call=after_tool_call,   # 每次工具执行后审计（含未执行成功的调用）
+                tool_selector=selector.select,
             )
-
-    run_scenario(
+    try:
+        run_scenario(
         "场景 A：REPL —— 启动后直接输入；agent 答完停下等你；输入 quit 结束",
         prompts=prompts,
         config=ConfigA(),
         context=ctx_a,
     )
-    conn.close()
+    finally:
+        try:
+            registry.close()
+        finally:
+            conn.close()

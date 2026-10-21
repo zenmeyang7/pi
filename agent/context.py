@@ -1,13 +1,12 @@
 import json
 import re
-from dataclasses import dataclass
 
 from tokenizers import Tokenizer
 
 from agent.llm import model as llm_model
 from agent.protocol import stream_deepseek
 
-# 模型最大上下文：GET /models 返回 deepseek-flash context_window=1048576
+# 模型最大上下文
 MAX_TOKENS = 1048576
 OUTPUT_TOKENS = 2000
 SAFE_TOKENS = round(MAX_TOKENS * 0.05)
@@ -186,6 +185,136 @@ def compact_tools_result(messages, max_tools_token, keep_recent=RECENT_KEEP):
             for i, m in enumerate(messages)]
 
 
+SUMMARY_FALLBACK_HEADER = "[旧历史摘要·自动生成]"
+TOOL_OMIT_MARK = "[旧工具结果已省略：{tokens} tokens]"
+
+
+def _take_tokens(text: str, n: int) -> str:
+    ids = tok.encode(text, add_special_tokens=False).ids
+    return tok.decode(ids[:max(0, n)])
+
+
+def _one_line(value, limit=160) -> str:
+    text = str(value or "").replace("\n", " ").strip()
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _extractive_summary(messages, max_tokens, previous_summary=""):
+    """不调用 LLM 的兜底摘要：从新到旧抽关键行，硬性不超 token 预算。"""
+    header_tokens = count_tokens(SUMMARY_FALLBACK_HEADER)
+    budget = max_tokens - header_tokens - 16   # 16 留给省略提示
+    lines = []
+
+    if previous_summary and budget > 0:
+        kept = _take_tokens(previous_summary, budget // 2)
+        lines.append(kept)
+        budget -= count_tokens(kept)
+
+    omitted = 0
+    picked = []
+    for message in reversed(messages):
+        role = message.get("role")
+        if role == "user":
+            line = f"用户: {_one_line(message.get('content'))}"
+        elif role == "tool":
+            line = f"工具({message.get('name', '?')}): {_one_line(message.get('content'))}"
+        elif message.get("tool_calls"):
+            calls = ", ".join(
+                f"{tc.get('function', {}).get('name', '?')}"
+                f"({_one_line(tc.get('function', {}).get('arguments'), 60)})"
+                for tc in message["tool_calls"]
+            )
+            line = f"助手调用: {calls}"
+        else:
+            line = f"助手: {_one_line(message.get('content'))}"
+
+        cost = count_tokens(line) + 1
+        if cost > budget:
+            omitted += 1
+            continue
+        picked.append(line)
+        budget -= cost
+
+    if omitted:
+        picked.append(f"[更早的 {omitted} 条消息已省略]")
+    picked.reverse()                  # 新→旧 翻转成 旧→新
+    body = "\n".join(lines + picked)  # 上一轮摘要排在最前
+    return (SUMMARY_FALLBACK_HEADER + "\n" + body).strip()
+
+
+def _skeletonize_tool_call(tool_call: dict) -> dict:
+    tc = tool_call.copy()
+    function = tc.get("function")
+    if isinstance(function, dict):
+        n = count_tokens(function.get("arguments", ""))
+        if n > 8:
+            # arguments 保持合法 JSON，只留一个长度标记
+            tc["function"] = {**function, "arguments": '{"_truncated":%d}' % n}
+    return tc
+
+
+def _skeletonize_message(message: dict) -> dict:
+    """保留消息结构（tool_call_id 配对），把正文压到最小。"""
+    cleaned = message.copy()
+    content = cleaned.get("content")
+    if isinstance(content, str):
+        if cleaned.get("role") == "tool":
+            n = count_tokens(content)
+            cleaned["content"] = TOOL_OMIT_MARK.format(tokens=n) if n > 8 else content
+        else:
+            cleaned["content"] = content[:200]
+    tool_calls = cleaned.get("tool_calls")
+    if tool_calls:
+        cleaned["tool_calls"] = [_skeletonize_tool_call(tc) for tc in tool_calls]
+    return cleaned
+
+
+def _drop_oldest_group(messages):
+    """丢最旧的一条消息；若是 assistant tool_calls，连同它的 tool 结果一起丢。"""
+    first = messages[0]
+    ids = {tc.get("id") for tc in first.get("tool_calls") or []}
+    end = 1
+    while (end < len(messages)
+           and messages[end].get("role") == "tool"
+           and messages[end].get("tool_call_id") in ids):
+        end += 1
+    return messages[end:]
+
+
+def _fit_to_budget(system_prompt, messages, tools, budget):
+    """最后保险：确定性收缩到预算内，不依赖 LLM，也不抛异常。"""
+    def used():
+        return count_context_tokens(system_prompt, messages, tools)
+
+    if used() <= budget:
+        return messages
+
+    messages = compact_tools_result(messages, max_tools_token=1000, keep_recent=0)
+    if used() <= budget:
+        return messages
+
+    messages = [_skeletonize_message(m) for m in messages]
+    if used() <= budget:
+        return messages
+
+    while used() > budget and len(messages) > 1:
+        dropped = _drop_oldest_group(messages)
+        if not dropped:        # 最后一组 tool 交换，不能整组丢光
+            break
+        messages = dropped
+    if used() <= budget:
+        return messages
+
+    # 只剩最后一条仍超预算：按 token 截断它，保证这次调用不超上下文
+    overflow = used() - budget
+    last = messages[-1].copy()
+    content = last.get("content")
+    if isinstance(content, str):
+        allowed = max(0, count_tokens(content) - overflow - 8)
+        last["content"] = _take_tokens(content, allowed) if allowed else "…"
+    return messages[:-1] + [last]
+
+
 def add_summary(base_system_prompt: str, summary: str) -> str:
     if not summary:
         return base_system_prompt
@@ -193,36 +322,66 @@ def add_summary(base_system_prompt: str, summary: str) -> str:
 
 
 def _summarize(model, llm_context, api_key, base_url) -> str:
-    """复用 SSE 通道做摘要；关掉 thinking，避免推理 token 吃掉输出预算。"""
+    """LLM 摘要只是优化项：任何失败都返回 ""，交给确定性兜底。"""
     option = {"api_key": api_key, "base_url": base_url,
               "temperature": 0, "max_tokens": SUMMARY_MAX_TOKENS,
               "thinking": {"type": "disabled"}}
-    summary = ""
-    for event in stream_deepseek(model, llm_context, option):
-        if event["type"] in ("done", "error"):
-            summary = (event.get("message") or {}).get("content") or ""
-    return summary.strip()
+    try:
+        for event in stream_deepseek(model, llm_context, option):
+            if event["type"] == "error":
+                return ""
+            if event["type"] == "done":
+                return ((event.get("message") or {}).get("content") or "").strip()
+    except Exception:
+        return ""
+    return ""
 
 
-def compact_old_history(messages, system_prompt, api_key, base_url, recent_keep):
-    """L3/L4：把旧消息总结成摘要，返回 (summary, 保留的近端消息)。
+def _split_index(messages, keep) -> int:
+    """找出既保留 keep 条、又不切断 tool 调用组的分界点。
 
-    摘要为空或没变短就退回 ("", 原 messages)：宁可不压，也不要丢掉历史
-    还换回一段垃圾。
+    分界左端不能是带 tool_calls 的 assistant（否则 tool 结果被留在近端），
+    分界右端不能是 tool（否则近端以孤立 tool 结果开头）。两种都会被
+    服务端判为非法消息序列。
+    """
+    split = max(0, len(messages) - keep)
+    while split > 0:
+        prev = messages[split - 1]
+        starts_with_tool = messages[split].get("role") == "tool"
+        ends_with_call = (prev.get("role") == "assistant"
+                          and prev.get("tool_calls"))
+        if not starts_with_tool and not ends_with_call:
+            break
+        split -= 1
+    return split
+
+
+def compact_old_history(messages, system_prompt, api_key, base_url, recent_keep,
+                        previous_summary=""):
+    """L3/L4：生成摘要，返回 (summary, 保留的近端消息)。
+
+    优先用 LLM 摘要；失败、为空或不够短时退化为确定性抽取摘要。
+    只要压得动就一定会压，不会因为外部调用失败而放弃。
     """
     if len(messages) <= recent_keep:
         return "", messages
 
-    old_messages = messages[:-recent_keep]
-    recent_messages = messages[-recent_keep:]
-    # 摘要请求不带工具：定义只烧 token，还会干扰生成
+    split = _split_index(messages, recent_keep)
+    if split <= 0:
+        return "", messages
+    old_messages = messages[:split]
+    recent_messages = messages[split:]
+    old_tokens = count_message_tokens(old_messages)
+
     llm_context = {"messages": old_messages, "system_prompt": system_prompt, "tools": []}
     summary = _summarize(llm_model(), llm_context, api_key, base_url)
 
-    if not summary or count_tokens(summary) >= count_message_tokens(old_messages):
+    if not summary or count_tokens(summary) >= old_tokens:
+        summary = _extractive_summary(old_messages, SUMMARY_MAX_TOKENS, previous_summary)
+
+    if not summary or count_tokens(summary) >= old_tokens:
         return "", messages
     return summary, recent_messages
-
 
 def _handoff_prompt(previous_summary=""):
     """已有旧摘要时必须要求合并，否则多轮压缩会丢掉更早的历史。"""
@@ -273,15 +432,16 @@ def context_pressure(system_prompt, messages, tools, api_key, base_url,
             api_key=api_key,
             base_url=base_url,
             recent_keep=RECENT_KEEP,
+            previous_summary=previous_summary,
         )
         if summary:
             system_prompt = add_summary(base_system_prompt, summary)
+        messages = _fit_to_budget(system_prompt, messages, tools, CONTEXT_BUDGET)
         print(f"清理后的数量{count_context_tokens(system_prompt, messages, tools)}")
         return system_prompt, messages, summary
 
     print("L4：强制压缩")
     summary = ""
-    # 有上限：摘要如果压不下去（空摘要 / 比原文长），必须能停下来
     for _ in range(MAX_COMPACT_ROUNDS):
         new_summary, compacted = compact_old_history(
             messages=messages,
@@ -289,9 +449,9 @@ def context_pressure(system_prompt, messages, tools, api_key, base_url,
             api_key=api_key,
             base_url=base_url,
             recent_keep=2,
+            previous_summary=summary or previous_summary,
         )
         if not new_summary:
-            print("摘要未生效，停止压缩")
             break
 
         summary = new_summary
@@ -303,7 +463,7 @@ def context_pressure(system_prompt, messages, tools, api_key, base_url,
             messages = compact_tools_result(messages, max_tools_token=1000)
         if count_context_tokens(system_prompt, messages, tools) <= CONTEXT_BUDGET:
             break
-    else:
-        print("达到压缩轮次上限，仍未回到预算内")
 
+    # 最后一层保险：即使摘要失败或仍超预算，也确定性地压到预算内
+    messages = _fit_to_budget(system_prompt, messages, tools, CONTEXT_BUDGET)
     return system_prompt, messages, summary
